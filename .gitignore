@@ -1,0 +1,11 @@
+.vscode/
+__pycache__/
+*.pyc
+
+# training artifacts
+claude_cnn/runs/
+claude_cnn/figures/
+cnn_cache/
+inference_outputs/
+training_cutouts_output/
+*.pt

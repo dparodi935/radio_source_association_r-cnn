@@ -1,0 +1,6 @@
+astropy==6.0.1
+matplotlib==3.11.0
+numpy==1.26.4
+selenium==4.46.0
+torch==2.13.0
+torchvision==0.28.0
