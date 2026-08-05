@@ -20,6 +20,7 @@ class SamplesPreprocessor():
         self.fits_filename = "facet_5"
         self.size = 192
         self.max_neighbours = 10 #limit number of proposals generated
+        self.fits_folder_path = os.path.join("path","to","cutouts_folder")
         
         self.create_file_paths()
         self.extract_data()
@@ -34,14 +35,14 @@ class SamplesPreprocessor():
         #create filepaths
         catalogue_filename = f"{self.fits_filename}_sources" 
         gt_catalogue_filename = f"{self.fits_filename}_catalogue_official"
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        fits_folder_path = os.path.join(script_dir,"..","lofar_downloads")
+        fits_folder_path = self.fits_folder_path
         
         self.fits_filepath = os.path.join(fits_folder_path,f"{self.fits_filename}.fits")
         self.catalogue_filepath = os.path.join(fits_folder_path,f"{catalogue_filename}.fits")
         self.gt_catalogue_filepath = os.path.join(fits_folder_path,f"{gt_catalogue_filename}.fits")
         self.cutout_filepath = os.path.join(fits_folder_path, "cutouts") # where to find the cutouts used for training
 
+        script_dir = os.path.dirname(os.path.abspath(__file__))
         self.cutout_test_path = os.path.join(script_dir, "training_cutouts_output") # where to save training cutouts (with boxes draw)
 
         
