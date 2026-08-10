@@ -351,7 +351,14 @@ class SamplesPreprocessor:
                          (np.abs(raw_y - pixel_pos[1]) < half) &
                          (raw_key != key))
             neighbours = raw[in_bounds]
- 
+
+            #calculate neighbour positions
+            nb_sorted = self.sort_by_proximity(centre_gauss, neighbours)[:self.max_neighbours]
+            nb_xy = np.stack([
+                np.asarray(nb_sorted["Xposn"], float) - origin[0],
+                np.asarray(nb_sorted["Yposn"], float) - origin[1]], axis=1) \
+                if len(nb_sorted) else np.empty((0, 2))
+            
             proposals, n_dropped = self.generate_proposals(
                 source_centre, centre_gauss, neighbours)
             if n_dropped:
@@ -369,6 +376,7 @@ class SamplesPreprocessor:
                 "gt_box": gt_box,
                 "gt_label": gt_label,
                 "n_dropped": n_dropped,
+                "neighbour_xy": nb_xy.astype(np.float32)
             })
  
         if verbose:

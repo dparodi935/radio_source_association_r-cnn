@@ -4,13 +4,14 @@ import os
 import numpy as np
 import torch
 import torch.nn.functional as F
+from collections import defaultdict
 
 from dataset import RadioGalaxyDataset, split_mosaics
 from losses import decode_boxes
 from model import TinyFastRCNN
 
-CLASS_NAMES = {0: "background", 1: "single", 2: "multi-component"}
-CLASS_COLORS = {1: "lime", 2: "orange"}
+CLASS_NAMES = {0: "background", 1: "source"}
+CLASS_COLORS = {1: "lime"}
 
 
 def predict_best(model, image, proposals, device, use_regression=False):
@@ -52,6 +53,15 @@ def components_in_box(box, centre_xy, neighbour_xy):
             inside.append(i + 1)
     return inside
 
+def count_components(box, neighbour_xy):
+    """Number of components inside the predicted region (centre always counts)."""
+    if neighbour_xy is None or len(neighbour_xy) == 0:
+        return 1
+    x1, y1, x2, y2 = [float(v) for v in box]
+    xy = np.asarray(neighbour_xy, dtype=float)
+    inside = ((xy[:, 0] >= x1) & (xy[:, 0] <= x2) &
+              (xy[:, 1] >= y1) & (xy[:, 1] <= y2))
+    return 1 + int(inside.sum())
 
 def evaluate(model, dataset, device, use_regression=False, verbose_n=10):
     """Catalogue accuracy (Mostert et al. 2022): a prediction is correct only if
@@ -62,13 +72,16 @@ def evaluate(model, dataset, device, use_regression=False, verbose_n=10):
     n = len(dataset)
     correct = baseline = with_gt = 0
     too_many = too_few = 0
+    per = defaultdict(lambda: {"n": 0, "correct": 0, "baseline": 0})
 
     for i in range(n):
         image, proposals, gt_boxes, gt_labels = dataset[i]
         if len(gt_boxes) == 0:
             continue
         with_gt += 1
-
+        mid = dataset.samples[i]["mosaic_id"]
+        per[mid]["n"] += 1
+        
         box, score, label, idx = predict_best(
             model, image.unsqueeze(0), proposals, device, use_regression)
 
@@ -83,6 +96,7 @@ def evaluate(model, dataset, device, use_regression=False, verbose_n=10):
 
         if iou > 0.9:
             correct += 1
+            per[mid]["correct"] += 1
         elif a1 > a2:
             too_many += 1
         else:
@@ -96,6 +110,7 @@ def evaluate(model, dataset, device, use_regression=False, verbose_n=10):
         ba = (float(base[2]) - float(base[0])) * (float(base[3]) - float(base[1]))
         if binter / max(ba + a2 - binter, 1e-9) > 0.9:
             baseline += 1
+            per[mid]["baseline"] += 1
 
         if i < verbose_n:
             print(f"  [{i}] {CLASS_NAMES[label]:>15s} score={score:.3f} "
@@ -116,10 +131,24 @@ def evaluate(model, dataset, device, use_regression=False, verbose_n=10):
     print(f"no-assoc baseline  : {res['baseline']:.1%}")
     print(f"region too large   : {res['too_many']:.1%}")
     print(f"region too small   : {res['too_few']:.1%}")
+    
+    print("\nper mosaic:")
+    print(f"  {'mosaic':<12} {'n':>5} {'acc':>7} {'base':>7} {'gap':>7}")
+    gaps = []
+    for mid, d in sorted(per.items()):
+        acc = d["correct"] / d["n"]
+        base = d["baseline"] / d["n"]
+        gaps.append(acc - base)
+        print(f"  {mid:<12} {d['n']:>5} {acc:>6.1%} {base:>6.1%} {acc-base:>+6.1%}")
+    if len(gaps) > 1:
+        g = np.array(gaps)
+        print(f"  gap across mosaics: mean {g.mean():+.1%}, "
+              f"min {g.min():+.1%}, max {g.max():+.1%}")
+    
     return res
 
 
-def visualize(image, box, gt_box, score, label, save_path, title=None):
+def visualize(image, box, gt_box, score, label, save_path, title=None, n_pred=1):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -153,7 +182,7 @@ def visualize(image, box, gt_box, score, label, save_path, title=None):
     color = CLASS_COLORS.get(label, "red")
     ax.add_patch(patches.Rectangle((x1, y1), x2 - x1, y2 - y1, lw=1.5,
                                    edgecolor=color, facecolor="none"))
-    ax.text(x1, y1 - 2, f"{CLASS_NAMES.get(label, label)} {score:.2f}",
+    ax.text(x1, y1 - 2, f"{n_pred} comp  {score:.2f}",
             color=color, fontsize=8, va="bottom")
     ax.set_title(title or "", fontsize=8)
     ax.axis("off")
@@ -171,7 +200,7 @@ def main():
                     help="only used if the checkpoint has no stored config")
     ap.add_argument("--max-neighbours", type=int, default=11,
                     help="only used if the checkpoint has no stored config")
-    ap.add_argument("--num-classes", type=int, default=3)
+    ap.add_argument("--num-classes", type=int, default=2)
     ap.add_argument("--num-figures", type=int, default=12)
     ap.add_argument("--seed", type=int, default=42,
                     help="must match the seed used in train.py")
@@ -221,13 +250,20 @@ def main():
                                   ds.samples[i]["gt_label"][0] != 2
                                   if len(ds.samples[i]["gt_label"]) else True))
     
-    for n, i in enumerate(order[:a.num_figures]):
+    for i in range(min(a.num_figures, len(ds))):
         image, proposals, gt_boxes, gt_labels = ds[i]
         box, score, label, _ = predict_best(
             model, image.unsqueeze(0), proposals, device, a.use_regression)
+
+        nb_xy = ds.samples[i].get("neighbour_xy")
+        n_pred = count_components(box, nb_xy)
+        n_true = count_components(gt_boxes[0], nb_xy) if len(gt_boxes) else 0
+
         visualize(image, box, gt_boxes, score, label,
                   os.path.join(a.output_dir, f"sample_{i:04d}.png"),
-                  title=ds.samples[i]["source_name"])
+                  title=f"{ds.samples[i]['source_name']}\n"
+                        f"pred {n_pred} comp / true {n_true}",
+                  n_pred=n_pred)
     print(f"figures -> {a.output_dir}/")
     
     

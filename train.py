@@ -78,7 +78,7 @@ def run_epoch(model, loader, optimizer, num_classes, fg_iou, bg_iou, device):
     return tot_cls / n_batches, tot_reg / n_batches, n_correct, n_scored, 0
 
 
-def train(data_root, out_path, num_classes=3, in_channels=3, size=200,
+def train(data_root, out_path, num_classes=2, in_channels=3, size=200,
           max_neighbours=11, batch_size=4, num_epochs=20, lr=1e-4,
           fg_iou=0.8, bg_iou=0.5, max_train=None, max_val=None,
           seed=42, device=None):
@@ -154,7 +154,7 @@ if __name__ == "__main__":
     ap.add_argument("--max-train", type=int, default=None,
                     help="cap on number of training mosaics")
     ap.add_argument("--max-val", type=int, default=None)
-    ap.add_argument("--num-classes", type=int, default=3)
+    ap.add_argument("--num-classes", type=int, default=2)
     a = ap.parse_args()
 
     train(a.data_root, a.out, num_classes=a.num_classes, size=a.size,
