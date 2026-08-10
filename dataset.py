@@ -11,8 +11,8 @@ from cutouts import SamplesPreprocessor, discover_mosaics
 class RadioGalaxyDataset(Dataset):
     """Concatenates samples from an explicit list of mosaics."""
 
-    def __init__(self, data_root, mosaic_ids, size=200, max_neighbours=11,
-                 transform=None, verbose=True):
+    def __init__(self, data_root, mosaic_ids, size=200, max_neighbours=8,
+                 transform=None, verbose=True, rotations=(0,)):
         self.data_root = data_root
         self.mosaic_ids = list(mosaic_ids)
         self.transform = transform
@@ -20,7 +20,8 @@ class RadioGalaxyDataset(Dataset):
         self.samples = []
         for mid in self.mosaic_ids:
             pre = SamplesPreprocessor(mid, data_root, size=size,
-                                      max_neighbours=max_neighbours)
+                                      max_neighbours=max_neighbours,
+                                      rotations=rotations)
             self.samples.extend(pre.generate_samples_list(verbose=verbose))
 
         if verbose:

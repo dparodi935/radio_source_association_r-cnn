@@ -13,6 +13,9 @@ import matplotlib.patches as patches
 import torch
 from torchvision.ops import box_iou
 import glob, re
+import torchvision.transforms.functional as TF
+
+ENCODING_VERSION = "sigma3_rot"      # bump: cache now holds rotated cutouts
 
 
 # --- folder names, one per catalogue type. Edit to match your disk layout. ---
@@ -43,15 +46,16 @@ def discover_mosaics(data_root):
 
 class SamplesPreprocessor:
     """Builds training samples for ONE mosaic."""
- 
+
     def __init__(self, mosaic_id, data_root, size=200, max_neighbours=11,
-                 reuse_cutouts=True):
+                 reuse_cutouts=True, rotations=(0,)):
         self.mosaic_id = mosaic_id
         self.data_root = data_root
         self.size = size
         self.max_neighbours = max_neighbours
         self.reuse_cutouts = reuse_cutouts
- 
+        self.rotations = tuple(rotations)      # (0,) for val/test
+
         self.create_file_paths()
         self.extract_data()
         self.open_catalogues()
@@ -66,7 +70,8 @@ class SamplesPreprocessor:
         self.raw_cat_path = os.path.join(r, DIR_RAW, f"{m}.fits")
         self.large_cat_path = os.path.join(r, DIR_LARGE, f"{m}.fits")
         self.comp_cat_path = os.path.join(r, DIR_COMP, f"{m}.fits")
-        self.cutout_dir = os.path.join(r, DIR_CUTOUT, m)
+        self.cutout_dir = os.path.join(
+            r, DIR_CUTOUT, f"{m}_{ENCODING_VERSION}_{self.size}")
         os.makedirs(self.cutout_dir, exist_ok=True)
  
         for p in (self.fits_filepath, self.raw_cat_path,
@@ -85,7 +90,8 @@ class SamplesPreprocessor:
             self.coord_system = WCS(f[0].header).celestial
             self.coord_scale = proj_plane_pixel_scales(self.coord_system)[1]  # deg/px
         self.pixel_arcsec = self.coord_scale * 3600.0
-    
+        self.beam_arcsec = float(f[0].header["BMAJ"]) * 3600.0
+        
     def _shape_scale(self, table):
         """Pixels per catalogue shape unit. LoTSS catalogues use arcsec; PyBDSF's
         own FITS writer uses degrees. Decide from TUNIT, fall back on magnitude."""
@@ -145,7 +151,7 @@ class SamplesPreprocessor:
                 tbl["Xposn"] = x
                 tbl["Yposn"] = y
 
-        # --- NEW: shape-column units -> pixels ---
+        # shape-column units -> pixels ---
         self.shape_scale = self._shape_scale(self.raw_catalogue)
 
         med_px = float(np.nanmedian(np.asarray(self.raw_catalogue["Maj"], float))) * self.shape_scale
@@ -156,74 +162,49 @@ class SamplesPreprocessor:
                 f"[{self.mosaic_id}] median source is {med_px:.0f} px across but the "
                 f"cutout is only {self.size} px — check the Maj/Min units")
 
-        
-    def ellipse_extent(self, gauss):
-        theta = np.radians(90.0 - gauss["PA"])
-        a = gauss["Maj"] * self.shape_scale     # -> pixels
-        b = gauss["Min"] * self.shape_scale
-        x_extent = np.hypot(a * np.cos(theta), b * np.sin(theta))
-        y_extent = np.hypot(a * np.sin(theta), b * np.cos(theta))
-        return x_extent, y_extent
-        
+        self.n_truth_lost = 0
 
-    def return_ellipse_displacement(self, gauss_1, gauss_2):
-        """Returns the displacement in pixels between the centre of two ellipses
-
-        Args:
-            gauss_1 (dict): The origin ellipse
-            gauss_2 (dict): The new ellipse to which the distance is calculated
-
-        Returns:
-            tuple (delta_x, delta_y): Displacement vector in pixels from ellipse 1 to ellipse 2
-        """
-        
-        if "Xposn" in gauss_2:
-            delta_x = gauss_2["Xposn"] - gauss_1["Xposn"]
-            delta_y = gauss_2["Yposn"] - gauss_1["Yposn"]
-        else:
-            #this code is for when the catalogue distances needs to be translated into pixels
-            delta_ra = gauss_2["RA"] - gauss_1["RA"]
-            delta_dec = gauss_2["DEC"] - gauss_1["DEC"]
     
-            cos_dec = np.cos(np.radians(gauss_1["DEC"]))
-            
-            # 3. Convert angular degrees to pixels
-            # (RA increases to the left/East in standard FITS, so we invert delta_x)
-            delta_x = -(delta_ra * cos_dec) / self.coord_scale
-            delta_y = delta_dec / self.coord_scale
+    def _rotate_point(self, x, y, angle_deg):
+        """Rotate about the cutout centre, matching scipy.ndimage.rotate."""
+        c = (self.size - 1) / 2.0
+        th = np.radians(-angle_deg)
+        cos, sin = np.cos(th), np.sin(th)
+        dx, dy = np.asarray(x, float) - c, np.asarray(y, float) - c
+        return cos * dx - sin * dy + c, sin * dx + cos * dy + c
 
-        return delta_x, delta_y
-        
 
-    def return_bounding_box(self, centre, gauss_1, gauss_list=None):
-        """Tight box (in cutout pixel coords) around gauss_1 plus any others.
- 
-        centre: cutout-frame position of gauss_1.
-        Others are placed by their pixel offset from gauss_1.
+    def _rotate_image(self, img, angle_deg):
+        if angle_deg % 360 == 0:
+            return img
+        t = torch.from_numpy(np.ascontiguousarray(img))          # (C,H,W)
+        r = TF.rotate(t, float(angle_deg),
+                      interpolation=TF.InterpolationMode.BILINEAR,
+                      expand=False, fill=0.0)
+        return r.numpy().astype(np.float32)
+
+
+    def _box_from_members(self, rows, cutout_xy, angle_deg):
+        """Tight box around a set of components after rotation.
+
+        rows      : table rows (for Maj/Min/PA)
+        cutout_xy : (n,2) their positions in UNROTATED cutout coords
         """
-        dx1, dy1 = self.ellipse_extent(gauss_1)
-        x1, y1 = centre[0] - dx1, centre[1] - dy1
-        x2, y2 = centre[0] + dx1, centre[1] + dy1
- 
-        if gauss_list is None:
-            gauss_list = []
- 
-        for gauss in gauss_list:
-            dx2, dy2 = self.ellipse_extent(gauss)
-            gx = centre[0] + (gauss["Xposn"] - gauss_1["Xposn"])
-            gy = centre[1] + (gauss["Yposn"] - gauss_1["Yposn"])
-            x1 = min(x1, gx - dx2)
-            y1 = min(y1, gy - dy2)
-            x2 = max(x2, gx + dx2)
-            y2 = max(y2, gy + dy2)
- 
-        # clip to the cutout, in ABSOLUTE cutout coords (not relative to centre)
-        x1 = max(x1, 0.0)
-        y1 = max(y1, 0.0)
-        x2 = min(x2, float(self.size))
-        y2 = min(y2, float(self.size))
-        return [x1, y1, x2, y2]
-
+        xs, ys = [], []
+        rx, ry = self._rotate_point(cutout_xy[:, 0], cutout_xy[:, 1], angle_deg)
+        for row, x, y in zip(rows, np.atleast_1d(rx), np.atleast_1d(ry)):
+            # the ellipse rotates with the image: add angle to its PA
+            theta = np.radians(90.0 - (row["PA"] + angle_deg))
+            a = row["Maj"] * self.shape_scale
+            b = row["Min"] * self.shape_scale
+            dx = np.hypot(a * np.cos(theta), b * np.sin(theta))
+            dy = np.hypot(a * np.sin(theta), b * np.cos(theta))
+            xs += [x - dx, x + dx]
+            ys += [y - dy, y + dy]
+        xs, ys = np.array(xs), np.array(ys)
+        return [float(max(xs.min(), 0.0)), float(max(ys.min(), 0.0)),
+                float(min(xs.max(), self.size)), float(min(ys.max(), self.size))]
+                        
 
     def sort_by_proximity(self, centre_gauss, catalogue):
         """Returns the neighbour catalogue ordered by pixel distance from centre_gauss, nearest first."""
@@ -233,71 +214,6 @@ class SamplesPreprocessor:
         d2 = ((np.asarray(catalogue["Xposn"], float) - centre_gauss["Xposn"]) ** 2 +
             (np.asarray(catalogue["Yposn"], float) - centre_gauss["Yposn"]) ** 2)
         return catalogue[np.argsort(d2)]
-
-
-    def generate_proposals(self, centre, centre_gauss, neighbours):
-        """Generates the region proposals for the R-CNN by finding the bounding box of every combination of ellipse that includes the central one
-            Number of proposals limited by a maximum number of neighbours considered
-        Args:
-            centre (tuple[float,float]): Coordinates of the centre of ellipse 1 in terms of the cutout's axes
-            centre_gauss (dict): The ellipse that the cutout is centred on (and that is being classified by the R-CNN)
-            catalogue (list[dict]): List of other ellipses within the cutout
-
-        Returns:
-            ndarray: List of region proposals, each given by the coordinates of the bottom left and top right corner in pixels [x1,y1,x2,y2]
-        """
-        """Every subset of neighbours, unioned with the centre component."""
-        # in generate_proposals, before sorting
-        #beam_px = self.bmaj / self.coord_scale        # read BMAJ in extract_data
-        #keep = (np.asarray(nb["Maj"], float) * self.shape_scale > 1.5 * beam_px)
-        #nb = nb[keep]
-        
-        nb = self.sort_by_proximity(centre_gauss, neighbours)[:self.max_neighbours]
-        n_dropped = max(0, len(neighbours) - self.max_neighbours)
- 
-        proposals = []
-        for k in range(len(nb) + 1):
-            for combo in combinations(range(len(nb)), k):
-                members = [nb[i] for i in combo]
-                proposals.append(
-                    self.return_bounding_box(centre, centre_gauss, gauss_list=members))
- 
-        return np.asarray(proposals, dtype=np.float32), n_dropped           
-           
-    def generate_gt(self, centre_gauss, cutout_origin, centre_pix):
-        """ONE box: the union over all components sharing the centre's Source_Name.
- 
-        Returns (1,4) float32 and (1,) int64, or empty arrays if unavailable.
-        """
-        empty = (np.empty((0, 4), np.float32), np.empty((0,), np.int64))
- 
-        key = str(centre_gauss["Source_Name"])
-        va_name = self.source_of.get(key)
-        if va_name is None:
-            return empty                      # centre absent from component cat
- 
-        member_keys = self.members_of.get(va_name, [])
-        rows = [self.row_of_key[k] for k in member_keys if k in self.row_of_key]
-        if not rows:
-            return empty
-        members = self.raw_catalogue[rows]
- 
-        x1 = y1 = np.inf
-        x2 = y2 = -np.inf
-        for m in members:
-            # member position in cutout coords, via the cutout's own origin
-            cx = m["Xposn"] - cutout_origin[0]
-            cy = m["Yposn"] - cutout_origin[1]
-            bx = self.return_bounding_box((cx, cy), m)
-            x1, y1 = min(x1, bx[0]), min(y1, bx[1])
-            x2, y2 = max(x2, bx[2]), max(y2, bx[3])
- 
-        if not (x2 > x1 and y2 > y1):
-            return empty                      # union clipped away entirely
- 
-        label = 2 if len(member_keys) > 1 else 1
-        return (np.array([[x1, y1, x2, y2]], np.float32),
-                np.array([label], np.int64))
  
     
     def _in_image_bounds(self, pixel_pos):
@@ -321,7 +237,52 @@ class SamplesPreprocessor:
         ch2 = (s > 5.0).astype(np.float32)
         np.save(filepath, np.stack([ch0, ch1, ch2]).astype(np.float32))
         return True
-        
+    
+    
+    def _filter_unresolved(self, table):
+        """Drop compact, likely-unrelated neighbours (Mostert's GBC proxy)."""
+        if len(table) == 0:
+            return table
+        maj = np.asarray(table["Maj"], float)              # arcsec
+        mnr = np.maximum(np.asarray(table["Min"], float), 1e-6)
+        keep = (maj > 1.5 * self.beam_arcsec) | (maj / mnr > 1.5)
+        return table[keep]
+
+
+    def _gt_member_indices(self, centre_gauss, nb):
+        """Indices into [centre] + list(nb) of the true association.
+        Returns [] if the centre has no entry in the component catalogue."""
+        key = str(centre_gauss["Source_Name"])
+        va_name = self.source_of.get(key)
+        if va_name is None:
+            return []
+        member_keys = set(self.members_of.get(va_name, []))
+        if not member_keys:
+            return []
+        idx = [0]                                          # centre always
+        for i, r in enumerate(nb):
+            if str(r["Source_Name"]) in member_keys:
+                idx.append(i + 1)
+                
+        n_true = len(member_keys)
+        if n_true > len(idx):
+            self.n_truth_lost += 1
+            
+        return idx
+
+
+    def _make_cutout_array(self, cutout, centre_gauss):
+        """(3,H,W) sigma-encoded cutout, or None if unusable."""
+        rms_jy = float(centre_gauss["Isl_rms"]) * 1e-3     # mJy/beam -> Jy/beam
+        d = np.nan_to_num(cutout.data, nan=0.0, posinf=0.0, neginf=0.0)
+        if not np.isfinite(d).any() or rms_jy <= 0 or np.ptp(d) == 0:
+            return None
+        s = d / rms_jy
+        ch0 = np.sqrt(np.clip((s - 1.0) / 29.0, 0.0, 1.0))
+        ch1 = (s > 3.0).astype(np.float32)
+        ch2 = (s > 5.0).astype(np.float32)
+        return np.stack([ch0, ch1, ch2]).astype(np.float32)
+       
     def generate_samples_list(self, verbose=True):
         raw = self.raw_catalogue
         samples = []
@@ -347,37 +308,69 @@ class SamplesPreprocessor:
             origin = (cutout.origin_original[0], cutout.origin_original[1])
             source_centre = (pixel_pos[0] - origin[0], pixel_pos[1] - origin[1])
  
+            # neighbours, sorted + filtered exactly as generate_proposals does
             in_bounds = ((np.abs(raw_x - pixel_pos[0]) < half) &
                          (np.abs(raw_y - pixel_pos[1]) < half) &
                          (raw_key != key))
-            neighbours = raw[in_bounds]
+            neighbours = self._filter_unresolved(raw[in_bounds])
+            nb = self.sort_by_proximity(centre_gauss, neighbours)[:self.max_neighbours]
+            n_dropped = max(0, len(neighbours) - self.max_neighbours)
 
-            #calculate neighbour positions
-            nb_sorted = self.sort_by_proximity(centre_gauss, neighbours)[:self.max_neighbours]
-            nb_xy = np.stack([
-                np.asarray(nb_sorted["Xposn"], float) - origin[0],
-                np.asarray(nb_sorted["Yposn"], float) - origin[1]], axis=1) \
-                if len(nb_sorted) else np.empty((0, 2))
-            
-            proposals, n_dropped = self.generate_proposals(
-                source_centre, centre_gauss, neighbours)
-            if n_dropped:
-                n_truncated += 1
- 
-            gt_box, gt_label = self.generate_gt(centre_gauss, origin, source_centre)
-            if len(gt_box) == 0:
-                n_nogt += 1
- 
-            samples.append({
-                "mosaic_id": self.mosaic_id,
-                "source_name": key,
-                "cutout_path": filepath,
-                "proposals": proposals,
-                "gt_box": gt_box,
-                "gt_label": gt_label,
-                "n_dropped": n_dropped,
-                "neighbour_xy": nb_xy.astype(np.float32)
-            })
+            # component list: index 0 = centre, then neighbours
+            members = [centre_gauss] + [r for r in nb]
+            mem_xy = np.array(
+                [[pixel_pos[0] - origin[0], pixel_pos[1] - origin[1]]] +
+                [[float(r["Xposn"]) - origin[0], float(r["Yposn"]) - origin[1]]
+                 for r in nb], dtype=float)
+
+            # true association, as indices into `members`
+            gt_idx = self._gt_member_indices(centre_gauss, nb)
+
+            base_img = self._make_cutout_array(cutout, centre_gauss)
+            if base_img is None:
+                n_skipped += 1
+                continue
+
+            for angle in self.rotations:
+                img = self._rotate_image(base_img, angle)
+                fp = os.path.join(self.cutout_dir, f"{_safe(key)}_r{angle}.npy")
+                if not (self.reuse_cutouts and os.path.exists(fp)):
+                    np.save(fp, img)
+
+                proposals = []
+                for k in range(len(nb) + 1):
+                    for combo in combinations(range(1, len(nb) + 1), k):
+                        sel = (0,) + combo
+                        proposals.append(self._box_from_members(
+                            [members[j] for j in sel], mem_xy[list(sel)], angle))
+                proposals = np.asarray(proposals, dtype=np.float32)
+
+                if gt_idx:
+                    gt_box = np.array([self._box_from_members(
+                        [members[j] for j in gt_idx],
+                        mem_xy[list(gt_idx)], angle)], dtype=np.float32)
+                    gt_label = np.array([2 if len(gt_idx) > 1 else 1], np.int64)
+                else:
+                    gt_box = np.empty((0, 4), np.float32)
+                    gt_label = np.empty((0,), np.int64)
+                    if angle == self.rotations[0]:
+                        n_nogt += 1
+
+                nb_xy_rot = np.stack(self._rotate_point(
+                    mem_xy[1:, 0], mem_xy[1:, 1], angle), axis=1) \
+                    if len(nb) else np.empty((0, 2))
+
+                samples.append({
+                    "mosaic_id": self.mosaic_id,
+                    "source_name": key,
+                    "angle": angle,
+                    "cutout_path": fp,
+                    "proposals": proposals,
+                    "gt_box": gt_box,
+                    "gt_label": gt_label,
+                    "neighbour_xy": nb_xy_rot.astype(np.float32),
+                    "n_dropped": n_dropped,
+                })
  
         if verbose:
             total = len(self.centre_catalogue)
@@ -385,7 +378,8 @@ class SamplesPreprocessor:
                   f"({n_skipped} edge-skipped, {n_nogt} without GT, "
                   f"{n_truncated} neighbour-truncated, "
                   f"{self.n_deblended} deblended dropped, "
-                  f"{self.n_unjoined} comp rows unjoined)")
+                  f"{self.n_unjoined} comp rows unjoined)"
+                  f"{self.n_truth_lost/len(samples)} = fraction of true siblings being filtered out")
         return samples
     
         

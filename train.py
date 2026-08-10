@@ -81,7 +81,7 @@ def run_epoch(model, loader, optimizer, num_classes, fg_iou, bg_iou, device):
 def train(data_root, out_path, num_classes=2, in_channels=3, size=200,
           max_neighbours=11, batch_size=4, num_epochs=20, lr=1e-4,
           fg_iou=0.8, bg_iou=0.5, max_train=None, max_val=None,
-          seed=42, device=None):
+          seed=42, device=None, rotations=(0,)):
 
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
@@ -93,14 +93,16 @@ def train(data_root, out_path, num_classes=2, in_channels=3, size=200,
     print(f"test mosaics:  {test_ids}  (held out, not loaded here)")
 
     train_ds = RadioGalaxyDataset(data_root, train_ids, size=size,
-                                  max_neighbours=max_neighbours)
+                                  max_neighbours=max_neighbours,
+                                  rotations=rotations)      # e.g. (0, 25, 50, 100)
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                           collate_fn=collate_fn)
 
     val_dl = None
     if val_ids:
         val_ds = RadioGalaxyDataset(data_root, val_ids, size=size,
-                                    max_neighbours=max_neighbours)
+                                max_neighbours=max_neighbours,
+                                rotations=(0,))             # never (rotation-) augment val
         val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
                             collate_fn=collate_fn)
 
@@ -155,10 +157,11 @@ if __name__ == "__main__":
                     help="cap on number of training mosaics")
     ap.add_argument("--max-val", type=int, default=None)
     ap.add_argument("--num-classes", type=int, default=2)
+    ap.add_argument("--rotations", type=int, nargs="+", default=[0, 25, 50, 100])
     a = ap.parse_args()
 
     train(a.data_root, a.out, num_classes=a.num_classes, size=a.size,
           max_neighbours=a.max_neighbours, batch_size=a.batch_size,
           in_channels=a.in_channels,
           num_epochs=a.epochs, lr=a.lr, fg_iou=a.fg_iou, bg_iou=a.bg_iou,
-          max_train=a.max_train, max_val=a.max_val)
+          max_train=a.max_train, max_val=a.max_val, rotations=a.rotations)
