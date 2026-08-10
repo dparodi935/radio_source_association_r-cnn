@@ -4,7 +4,6 @@ from astropy.table import Table
 from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
 from astropy.io import fits
-from astropy.visualization import ImageNormalize, SinhStretch, ZScaleInterval
 import os
 import numpy as np
 from itertools import combinations
@@ -16,7 +15,6 @@ import glob, re
 import torchvision.transforms.functional as TF
 
 ENCODING_VERSION = "sigma3_rot"      # bump: cache now holds rotated cutouts
-
 
 # --- folder names, one per catalogue type. Edit to match your disk layout. ---
 DIR_MOSAIC = "mosaics"
@@ -150,7 +148,7 @@ class SamplesPreprocessor:
                     np.asarray(tbl["RA"], float), np.asarray(tbl["DEC"], float), 0)
                 tbl["Xposn"] = x
                 tbl["Yposn"] = y
-
+                
         # shape-column units -> pixels ---
         self.shape_scale = self._shape_scale(self.raw_catalogue)
 
@@ -292,7 +290,7 @@ class SamplesPreprocessor:
         raw_y = np.asarray(raw["Yposn"], float)
         raw_key = np.asarray(raw["Source_Name"]).astype(str)
         half = self.size / 2.0
- 
+
         for centre_gauss in self.centre_catalogue:
             pixel_pos = (float(centre_gauss["Xposn"]), float(centre_gauss["Yposn"]))
             if not self._in_image_bounds(pixel_pos):
@@ -328,6 +326,7 @@ class SamplesPreprocessor:
 
             base_img = self._make_cutout_array(cutout, centre_gauss)
             if base_img is None:
+
                 n_skipped += 1
                 continue
 
