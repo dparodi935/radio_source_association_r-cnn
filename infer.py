@@ -1,237 +1,235 @@
 import argparse
 import os
 
+import numpy as np
 import torch
 import torch.nn.functional as F
-from torchvision.ops import nms
 
-from model import TinyFastRCNN
+from dataset import RadioGalaxyDataset, split_mosaics
 from losses import decode_boxes
-from dataset import RadioGalaxyDataset
-
-
-def predict(model, image, proposals, score_threshold=0.5, nms_iou_threshold=0.3, device=None):
-    """
-    Runs inference on a single image with its candidate proposal boxes.
-
-    Args:
-        model: trained TinyFastRCNN
-        image: FloatTensor, shape (1, C, H, W)  -- single image, batch dim of 1
-        proposals: FloatTensor, shape (N, 4)    -- PyBDSF candidate boxes for this image
-        score_threshold: minimum class confidence to keep a detection
-        nms_iou_threshold: IoU threshold for suppressing duplicate detections
-
-    Returns:
-        final_boxes:  (K, 4) kept boxes after thresholding + NMS
-        final_scores: (K,)   confidence score of the kept class per box
-        final_labels: (K,)   predicted class id per box
-    """
-    device = device or next(model.parameters()).device
-    model.eval()
-
-    image = image.to(device)
-    proposals = proposals.to(device)
-
-    with torch.no_grad(): #turn off gradient tracking, the mechanism used to update the weights during training
-        # feed the cutout and the proposals to the model. Output: raw class scores, raw box adjustments
-        # WHERE ACTUAL INFERENCE HAPPENS
-        cls_logits, box_deltas = model(image, [proposals]) 
-
-        #scales the class scores into clean percentages
-        scores = F.softmax(cls_logits, dim=1)          # (N, num_classes). dim=1 so it reads the entire row (instead of dim=0 for a column)
-        num_classes = scores.size(1) # Extracts the number of classes (in this case 3) from tensor 
-
-        # Best non-background class per proposal
-        fg_scores, fg_labels = scores[:, 1:].max(dim=1) # finds the highest non-background (use [:, 1:] to isolate) score 
-        fg_labels = fg_labels + 1  # shift back since we sliced off background (class 0)
-
-        # Select the box-delta slice matching each proposal's predicted class
-        box_deltas = box_deltas.view(-1, num_classes, 4) #reshapes 1D array of box coordinates into 3D tensor
-        idx = torch.arange(box_deltas.size(0), device=device) #creates integer list from 0 up to number of boxes
-        selected_deltas = box_deltas[idx, fg_labels] #extracts box adjustments for the chosen class (ie. highest score non-bg)
-
-        #Applies the box adjustments to the proposal
-        decoded_boxes = decode_boxes(proposals, selected_deltas)
-
-        #Confidence filtering - Calculates and applies mask
-        keep_mask = fg_scores > score_threshold  # boolean mask that selects for scores above threshold
-        boxes = decoded_boxes[keep_mask]
-        scores = fg_scores[keep_mask]
-        labels = fg_labels[keep_mask]
-
-        # NMS per class, since boxes of different classes shouldn't suppress each other
-        final_boxes, final_scores, final_labels = [], [], []
-        for class_id in labels.unique():
-            class_mask = (labels == class_id)  # creates mask that selects for a given class (single or MC)
-            class_boxes = boxes[class_mask]
-            class_scores = scores[class_mask]
-
-            # nms: If boxes are highly overlapping, every box except the one with the highest score is removed
-            # nms_iou_threshold determine what highly overlapping means
-            keep = nms(class_boxes, class_scores, nms_iou_threshold)  
-            final_boxes.append(class_boxes[keep])
-            final_scores.append(class_scores[keep])
-            final_labels.append(torch.full((len(keep),), class_id, dtype=torch.long))
-
-        if final_boxes:
-            #if any boxes survived filtering, the python lists of tensors are merged into flat unified PyTorch tensor
-            final_boxes = torch.cat(final_boxes, dim=0)
-            final_scores = torch.cat(final_scores, dim=0)
-            final_labels = torch.cat(final_labels, dim=0)
-        else:
-            final_boxes = torch.empty((0, 4))
-            final_scores = torch.empty((0,))
-            final_labels = torch.empty((0,), dtype=torch.long)
-
-    return final_boxes, final_scores, final_labels
-
+from model import TinyFastRCNN
 
 CLASS_NAMES = {0: "background", 1: "single", 2: "multi-component"}
 CLASS_COLORS = {1: "lime", 2: "orange"}
 
 
-def visualize_detections(image, boxes, scores, labels, save_path=None, title=None):
-    """
-    Draws kept detection boxes over a single-channel cutout and saves/shows it.
+def predict_best(model, image, proposals, device, use_regression=False):
+    """Returns (best_box, best_score, best_label, best_index).
 
-    Args:
-        image: (1, H, W) or (H, W) tensor/array -- the cutout, on CPU
-        boxes, scores, labels: CPU tensors, the outputs of predict()
-        save_path: if given, saves the figure here instead of showing it
-        title: optional plot title
+    Unlike generic detection we want ONE region per cutout: the highest-scoring
+    proposal covering the centre component. No NMS -- proposals are a fixed
+    lattice of component subsets, not redundant guesses.
     """
+    model.eval()
+    image = image.to(device)
+    proposals = proposals.to(device)
+
+    with torch.no_grad():
+        cls_logits, box_deltas = model(image, [proposals])
+        scores = F.softmax(cls_logits, dim=1)
+        num_classes = scores.size(1)
+
+        fg_scores, fg_labels = scores[:, 1:].max(dim=1)
+        fg_labels = fg_labels + 1
+
+        best_idx = int(torch.argmax(fg_scores))
+        box = proposals[best_idx]
+
+        if use_regression:
+            d = box_deltas.view(-1, num_classes, 4)[best_idx, fg_labels[best_idx]]
+            box = decode_boxes(box[None, :], d[None, :])[0]
+
+    return (box.cpu(), float(fg_scores[best_idx]),
+            int(fg_labels[best_idx]), best_idx)
+
+
+def components_in_box(box, centre_xy, neighbour_xy):
+    """Which component centres fall inside the predicted region."""
+    x1, y1, x2, y2 = [float(v) for v in box]
+    inside = [0]                       # the centre component, always
+    for i, (x, y) in enumerate(neighbour_xy):
+        if x1 <= x <= x2 and y1 <= y <= y2:
+            inside.append(i + 1)
+    return inside
+
+
+def evaluate(model, dataset, device, use_regression=False, verbose_n=10):
+    """Catalogue accuracy (Mostert et al. 2022): a prediction is correct only if
+    the predicted region encloses exactly the right set of components.
+
+    Also reports the no-association baseline: assume every component stands alone.
+    """
+    n = len(dataset)
+    correct = baseline = with_gt = 0
+    too_many = too_few = 0
+
+    for i in range(n):
+        image, proposals, gt_boxes, gt_labels = dataset[i]
+        if len(gt_boxes) == 0:
+            continue
+        with_gt += 1
+
+        box, score, label, idx = predict_best(
+            model, image.unsqueeze(0), proposals, device, use_regression)
+
+        # IoU of the predicted region against the true region
+        gt = gt_boxes[0]
+        ix1 = max(float(box[0]), float(gt[0])); iy1 = max(float(box[1]), float(gt[1]))
+        ix2 = min(float(box[2]), float(gt[2])); iy2 = min(float(box[3]), float(gt[3]))
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        a1 = (float(box[2]) - float(box[0])) * (float(box[3]) - float(box[1]))
+        a2 = (float(gt[2]) - float(gt[0])) * (float(gt[3]) - float(gt[1]))
+        iou = inter / max(a1 + a2 - inter, 1e-9)
+
+        if iou > 0.9:
+            correct += 1
+        elif a1 > a2:
+            too_many += 1
+        else:
+            too_few += 1
+
+        # baseline: predict "no association" (proposal 0 == centre alone)
+        base = proposals[0]
+        bx1 = max(float(base[0]), float(gt[0])); by1 = max(float(base[1]), float(gt[1]))
+        bx2 = min(float(base[2]), float(gt[2])); by2 = min(float(base[3]), float(gt[3]))
+        binter = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        ba = (float(base[2]) - float(base[0])) * (float(base[3]) - float(base[1]))
+        if binter / max(ba + a2 - binter, 1e-9) > 0.9:
+            baseline += 1
+
+        if i < verbose_n:
+            print(f"  [{i}] {CLASS_NAMES[label]:>15s} score={score:.3f} "
+                  f"prop={idx:4d} IoU={iou:.3f}")
+
+    if with_gt == 0:
+        print("no samples with ground truth")
+        return {}
+
+    res = {
+        "n": with_gt,
+        "accuracy": correct / with_gt,
+        "baseline": baseline / with_gt,
+        "too_many": too_many / with_gt,
+        "too_few": too_few / with_gt,
+    }
+    print(f"\ncatalogue accuracy : {res['accuracy']:.1%}  ({correct}/{with_gt})")
+    print(f"no-assoc baseline  : {res['baseline']:.1%}")
+    print(f"region too large   : {res['too_many']:.1%}")
+    print(f"region too small   : {res['too_few']:.1%}")
+    return res
+
+
+def visualize(image, box, gt_box, score, label, save_path, title=None):
     try:
+        import matplotlib
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import matplotlib.patches as patches
     except ImportError:
-        print("matplotlib not installed -- skipping visualization (pip install matplotlib)")
         return
 
-    #squeeze removes the useless extra info from the tensor, creating a flat 2D grid. Then numpy turns into a np array
-    img = image.squeeze().numpy() if torch.is_tensor(image) else image
+    arr = image.numpy() if torch.is_tensor(image) else np.asarray(image)
+    if arr.ndim == 3 and arr.shape[0] in (1, 3):      # (C,H,W)
+        bg = arr[0]
+        mask5 = arr[2] if arr.shape[0] == 3 else None
+    else:                                              # legacy (H,W)
+        bg = np.squeeze(arr)
+        mask5 = None
 
-    fig, ax = plt.subplots(figsize=(6, 6))
-    ax.imshow(img, cmap="gray", origin="lower")
+    fig, ax = plt.subplots(figsize=(5, 5))
+    ax.imshow(bg, cmap="inferno", origin="lower", vmin=0, vmax=1)
+    if mask5 is not None and mask5.any():
+        ax.contour(mask5, levels=[0.5], colors="white",
+                   linewidths=0.6, alpha=0.7)
 
-    for box, score, label in zip(boxes, scores, labels):
-        x1, y1, x2, y2 = box.tolist()  # the two coordinates for the box 
-        color = CLASS_COLORS.get(int(label), "red")   #Looks at CLASS_COLORS to find colour, defaults to red if unable to
-        rect = patches.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=1.5,
-                                  edgecolor=color, facecolor="none")  #creates the box
-        ax.add_patch(rect)
-        ax.text(x1, y1 - 2, f"{CLASS_NAMES.get(int(label), int(label))} {score:.2f}", 
-                color=color, fontsize=8, va="bottom") #labels the box with the score and class
-
-    ax.set_title(title or "")
+    #add the ground truth box patch
+    if gt_box is not None and len(gt_box):
+        x1, y1, x2, y2 = [float(v) for v in gt_box[0]]
+        ax.add_patch(patches.Rectangle((x1, y1), x2 - x1, y2 - y1, lw=1.5,
+                                       edgecolor="cyan", facecolor="none",
+                                       linestyle="--"))
+        
+    x1, y1, x2, y2 = [float(v) for v in box]
+    color = CLASS_COLORS.get(label, "red")
+    ax.add_patch(patches.Rectangle((x1, y1), x2 - x1, y2 - y1, lw=1.5,
+                                   edgecolor=color, facecolor="none"))
+    ax.text(x1, y1 - 2, f"{CLASS_NAMES.get(label, label)} {score:.2f}",
+            color=color, fontsize=8, va="bottom")
+    ax.set_title(title or "", fontsize=8)
     ax.axis("off")
-
-    if save_path:
-        fig.savefig(save_path, bbox_inches="tight", dpi=150)
-        plt.close(fig)
-    else:
-        plt.show()
-
-
-def run_inference(
-    weights_path,
-    catalogue_path,
-    cutout_dir,
-    num_classes=3,
-    in_channels=1,
-    score_threshold=0.5,
-    nms_iou_threshold=0.3,
-    sample_indices=None,
-    output_dir="inference_outputs",
-    device=None,
-):
-    """
-    Loads a trained model and runs it over real dataset samples (real cutouts +
-    real PyBDSF proposals), printing kept detections and saving a visualization
-    for each sample.
-
-    Args:
-        weights_path: path to a .pt file saved by train.py
-        catalogue_path, cutout_dir: forwarded to RadioGalaxyDataset. NOTE: as of
-            now RadioGalaxyDataset ignores these and always loads whatever facet
-            is hardcoded in SamplesPreprocessor (currently "facet_5") -- see the
-            TODO in dataset.py. Wire these through properly before using this on
-            a different facet.
-        sample_indices: iterable of dataset indices to run inference on, or None
-            to run over the whole dataset
-        output_dir: where per-sample visualization PNGs are saved
-    """
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    #creates the CNN model and loads the generated weights
-    model = TinyFastRCNN(num_classes=num_classes, in_channels=in_channels).to(device)
-    model.load_state_dict(torch.load(weights_path, map_location=device))
-    model.eval() # puts model in evaluation mode, switching off trianing specific layers like Dropout and BatchNorm
-
-    dataset = RadioGalaxyDataset(catalogue_path, cutout_dir)
-    # which indices to actually use. Uses all unless specified otherwise
-    indices = sample_indices if sample_indices is not None else range(len(dataset))  
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    results = []
-    for idx in indices:
-        image, proposals, gt_boxes, gt_labels = dataset[idx]
-        image_batch = image.unsqueeze(0)  # From numpy array to (1, C, H, W), the batch-of-1 predict() expects
-
-        boxes, scores, labels = predict(
-            model, image_batch, proposals,
-            score_threshold=score_threshold,
-            nms_iou_threshold=nms_iou_threshold,
-            device=device,
-        )
-        boxes, scores, labels = boxes.cpu(), scores.cpu(), labels.cpu() # If tensors processed on GPU, this copies them to the CPU
-
-        #prints info about each image
-        print(f"Sample {idx}: {len(boxes)} detection(s)")
-        for box, score, label in zip(boxes, scores, labels):
-            name = CLASS_NAMES.get(int(label), int(label))
-            print(f"  {name:>16s}  score={score:.3f}  box={[round(v, 1) for v in box.tolist()]}")
-
-        #creates matplotlib image visualising the source and the detection box
-        visualize_detections(
-            image, boxes, scores, labels,
-            save_path=os.path.join(output_dir, f"sample_{idx}.png"),
-            title=f"Sample {idx} ({len(boxes)} detections)",
-        )
-
-        results.append({"idx": idx, "boxes": boxes, "scores": scores, "labels": labels})
-
-    print(f"\nSaved {len(results)} visualization(s) to {output_dir}/")
-    return results
-
-
-if __name__ == "__main__":
-    script_dir = os.path.dirname(os.path.abspath(__file__))
+    fig.savefig(save_path, bbox_inches="tight", dpi=130)
+    plt.close(fig)
     
-    parser = argparse.ArgumentParser(description="Run TinyFastRCNN inference on real cutouts")
-    parser.add_argument("--weights", default=os.path.join(script_dir,"tiny_fastrcnn_weights.pt"),
-                         help="Path to trained weights saved by train.py")
-    parser.add_argument("--catalogue-path", default="path/to/official_catalogue.csv")
-    parser.add_argument("--cutout-dir", default="path/to/cutouts")
-    parser.add_argument("--num-classes", type=int, default=3)
-    parser.add_argument("--in-channels", type=int, default=1)
-    parser.add_argument("--score-threshold", type=float, default=0.5)
-    parser.add_argument("--nms-iou-threshold", type=float, default=0.3)
-    parser.add_argument("--num-samples", type=int, default=50,
-                         help="Number of dataset samples to run inference on (-1 for all)")
-    parser.add_argument("--output-dir", default=os.path.join(script_dir, "inference_outputs"))
-    args = parser.parse_args()
 
-    sample_indices = None if args.num_samples == -1 else range(args.num_samples)
+def main():
+    here = os.path.dirname(os.path.abspath(__file__))
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data-root", required=True)
+    ap.add_argument("--weights", default=os.path.join(here, "weights.pt"))
+    ap.add_argument("--split", default="test", choices=["train", "val", "test"])
+    ap.add_argument("--size", type=int, default=200,
+                    help="only used if the checkpoint has no stored config")
+    ap.add_argument("--max-neighbours", type=int, default=11,
+                    help="only used if the checkpoint has no stored config")
+    ap.add_argument("--num-classes", type=int, default=3)
+    ap.add_argument("--num-figures", type=int, default=12)
+    ap.add_argument("--seed", type=int, default=42,
+                    help="must match the seed used in train.py")
+    ap.add_argument("--use-regression", action="store_true",
+                    help="apply box deltas; off by default (Mostert disables it)")
+    ap.add_argument("--output-dir", default=os.path.join(here, "inference_outputs"))
+    a = ap.parse_args()
 
-    run_inference(
-        weights_path=args.weights,
-        catalogue_path=args.catalogue_path,
-        cutout_dir=args.cutout_dir,
-        num_classes=args.num_classes,
-        in_channels=args.in_channels,
-        score_threshold=args.score_threshold,
-        nms_iou_threshold=args.nms_iou_threshold,
-        sample_indices=sample_indices,
-        output_dir=args.output_dir,
-    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # --- load checkpoint first: it dictates size/max_neighbours ---
+    ckpt = torch.load(a.weights, map_location=device)
+    if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        state_dict = ckpt["state_dict"]
+        size = ckpt.get("size", a.size)
+        max_nb = ckpt.get("max_neighbours", a.max_neighbours)
+        num_classes = ckpt.get("num_classes", a.num_classes)
+        in_channels = ckpt.get("in_channels", 1)
+        print(f"checkpoint config: size={size} max_neighbours={max_nb} "
+              f"num_classes={num_classes} in_channels={in_channels}")
+    else:
+        state_dict = ckpt
+        size, max_nb = a.size, a.max_neighbours
+        num_classes, in_channels = a.num_classes, 1
+        print(f"WARNING: legacy checkpoint with no stored config; "
+              f"falling back to --size {size} --max-neighbours {max_nb}. "
+              f"These MUST match what training used.")
+
+    train_ids, val_ids, test_ids = split_mosaics(a.data_root, seed=a.seed)
+    ids = {"train": train_ids, "val": val_ids, "test": test_ids}[a.split]
+    if not ids:
+        raise SystemExit(f"'{a.split}' split is empty: {train_ids} {val_ids} {test_ids}")
+    print(f"{a.split} mosaics: {ids}")
+
+    ds = RadioGalaxyDataset(a.data_root, ids, size=size, max_neighbours=max_nb)
+
+    model = TinyFastRCNN(num_classes=num_classes, in_channels=in_channels).to(device)
+    model.load_state_dict(state_dict)
+
+    res = evaluate(model, ds, device, use_regression=a.use_regression)
+
+    os.makedirs(a.output_dir, exist_ok=True)
+    
+    # pick interesting samples rather than the first N
+    order = sorted(range(len(ds)),
+                   key=lambda i: (len(ds.samples[i]["gt_label"]) == 0,
+                                  ds.samples[i]["gt_label"][0] != 2
+                                  if len(ds.samples[i]["gt_label"]) else True))
+    
+    for n, i in enumerate(order[:a.num_figures]):
+        image, proposals, gt_boxes, gt_labels = ds[i]
+        box, score, label, _ = predict_best(
+            model, image.unsqueeze(0), proposals, device, a.use_regression)
+        visualize(image, box, gt_boxes, score, label,
+                  os.path.join(a.output_dir, f"sample_{i:04d}.png"),
+                  title=ds.samples[i]["source_name"])
+    print(f"figures -> {a.output_dir}/")
+    
+    
+if __name__ == "__main__":
+    main()

@@ -68,8 +68,40 @@ def decode_boxes(proposals, deltas):
 
     return torch.stack([x1, y1, x2, y2], dim=1)
 
+def listwise_loss(cls_logits, proposals, gt_boxes, iou_thresh=0.9):
+    """One softmax per cutout over ITS OWN proposals.
 
-def match_boxes_to_gt(proposals, gt_boxes, gt_labels, iou_threshold=0.5):
+    cls_logits: (total_proposals, C) concatenated across the batch, in the same
+                order RoIAlign produced them (image 0's boxes, then image 1's...).
+    proposals:  list of (n_i, 4) tensors, one per image
+    gt_boxes:   list of (0|1, 4) tensors, one per image
+    """
+    losses = []
+    start = 0
+    for props, gt in zip(proposals, gt_boxes):
+        end = start + len(props)
+        if len(gt) > 0:
+            ious = box_iou(props, gt)[:, 0]
+            target = int(torch.argmax(ious))
+            if float(ious[target]) >= iou_thresh:
+                score = cls_logits[start:end, 1:].max(dim=1).values  # (n_i,)
+                losses.append(F.cross_entropy(
+                    score[None, :],
+                    torch.tensor([target], device=score.device)))
+        start = end
+    if not losses:
+        return cls_logits.sum() * 0.0
+    return torch.stack(losses).mean()
+
+def match_boxes_to_gt(proposals, gt_boxes, gt_labels,
+                      iou_threshold=0.5, bg_threshold=None):
+    """See below. If bg_threshold is given, proposals with IoU in
+    [bg_threshold, iou_threshold) are marked IGNORE (-1) and excluded from the
+    loss, following Mostert et al. 2022 (bg < 0.5, fg > 0.8)."""
+    return _match(proposals, gt_boxes, gt_labels, iou_threshold, bg_threshold)
+
+
+def _match(proposals, gt_boxes, gt_labels, iou_threshold=0.5, bg_threshold=None):
     """
     Assigns each proposal box (from PyBDSF, for ONE image) a class label and a
     matched ground-truth box, based on IoU overlap.
@@ -95,7 +127,12 @@ def match_boxes_to_gt(proposals, gt_boxes, gt_labels, iou_threshold=0.5):
     best_iou, best_gt_idx = ious.max(dim=1)       # (N,), (N,)
         
     matched_labels = gt_labels[best_gt_idx].clone()
-    matched_labels[best_iou < iou_threshold] = 0  # background
+    if bg_threshold is None:
+        matched_labels[best_iou < iou_threshold] = 0        # background
+    else:
+        ignore = (best_iou >= bg_threshold) & (best_iou < iou_threshold)
+        matched_labels[best_iou < bg_threshold] = 0         # background
+        matched_labels[ignore] = -1                         # excluded from loss
 
     matched_gt_boxes = gt_boxes[best_gt_idx]
 
@@ -124,9 +161,19 @@ def compute_losses(cls_logits, box_deltas, matched_labels, matched_proposals,
     # Compares predicted probability to actual label
     # cross_entropy takes in the three scores for each label, applies a softmax (restricting range to [0,1])
     # then uses -log(probability) for the true label score () 
+    # Drop IGNORE rows (label -1) entirely: they contribute to neither loss.
+    keep = matched_labels >= 0
+    if keep.sum() == 0:
+        zero = cls_logits.sum() * 0.0
+        return zero, box_deltas.sum() * 0.0
+    cls_logits = cls_logits[keep]
+    box_deltas = box_deltas[keep]
+    matched_labels = matched_labels[keep]
+    matched_proposals = matched_proposals[keep]
+    matched_gt_boxes = matched_gt_boxes[keep]
+
     cls_loss = F.cross_entropy(cls_logits, matched_labels)
 
-    
     pos_mask = matched_labels > 0 #mask to filter out background
     #if there are no galaxies (only background), set the loss to zero
     if pos_mask.sum() == 0:
