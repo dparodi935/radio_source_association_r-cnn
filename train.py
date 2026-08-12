@@ -8,7 +8,9 @@ from torch.utils.data import DataLoader
 
 from dataset import RadioGalaxyDataset, split_mosaics, collate_fn
 from losses import compute_losses, match_boxes_to_gt
+from cutouts import ENCODINGS, n_channels
 from model import TinyFastRCNN
+
 
 def balance(labels, bg_per_fg=3, generator=None):
     """Keep all fg, a limited sample of bg, drop ignores. Returns a bool mask."""
@@ -78,10 +80,15 @@ def run_epoch(model, loader, optimizer, num_classes, fg_iou, bg_iou, device):
     return tot_cls / n_batches, tot_reg / n_batches, n_correct, n_scored, 0
 
 
-def train(data_root, out_path, num_classes=2, in_channels=3, size=200,
-          max_neighbours=11, batch_size=4, num_epochs=20, lr=1e-4,
+def train(data_root, out_path, num_classes=2, size=200,
+          max_neighbours=8, batch_size=4, num_epochs=20, lr=1e-4,
           fg_iou=0.8, bg_iou=0.5, max_train=None, max_val=None,
-          seed=42, device=None, rotations=(0,)):
+          rotations=(0, 25, 50, 100), encoding="radio3",
+          seed=42, device=None):
+
+    in_channels = n_channels(encoding)      # derived, not passed
+    print(f"encoding: {encoding} -> {in_channels} channels "
+          f"{ENCODINGS[encoding]}")
 
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
@@ -94,15 +101,16 @@ def train(data_root, out_path, num_classes=2, in_channels=3, size=200,
 
     train_ds = RadioGalaxyDataset(data_root, train_ids, size=size,
                                   max_neighbours=max_neighbours,
-                                  rotations=rotations)      # e.g. (0, 25, 50, 100)
+                                  rotations=rotations, encoding=encoding)
+    
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                          collate_fn=collate_fn)
-
+                        collate_fn=collate_fn)
+    
     val_dl = None
     if val_ids:
         val_ds = RadioGalaxyDataset(data_root, val_ids, size=size,
                                 max_neighbours=max_neighbours,
-                                rotations=(0,))             # never (rotation-) augment val
+                                rotations=(0,), encoding=encoding)             # never (rotation-) augment val
         val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
                             collate_fn=collate_fn)
 
@@ -111,7 +119,9 @@ def train(data_root, out_path, num_classes=2, in_channels=3, size=200,
 
     # config travels with the weights so infer.py can't use a mismatched size
     meta = {"size": size, "max_neighbours": max_neighbours,
-            "num_classes": num_classes, "in_channels": in_channels}
+            "num_classes": num_classes, "in_channels": in_channels,
+            "encoding": encoding, "rotations": tuple(rotations),
+            "n_train_mosaics": len(train_ids), "epochs": num_epochs}
 
     best_acc = -1.0
     for epoch in range(num_epochs):
@@ -146,7 +156,7 @@ if __name__ == "__main__":
     ap.add_argument("--data-root", required=True)
     ap.add_argument("--out", default=os.path.join(here, "weights.pt"))
     ap.add_argument("--size", type=int, default=200)
-    ap.add_argument("--in-channels", type=int, default=3)
+    ap.add_argument("--encoding", default="radio3", choices=sorted(ENCODINGS))
     ap.add_argument("--max-neighbours", type=int, default=11)
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--epochs", type=int, default=20)
@@ -162,6 +172,5 @@ if __name__ == "__main__":
 
     train(a.data_root, a.out, num_classes=a.num_classes, size=a.size,
           max_neighbours=a.max_neighbours, batch_size=a.batch_size,
-          in_channels=a.in_channels,
           num_epochs=a.epochs, lr=a.lr, fg_iou=a.fg_iou, bg_iou=a.bg_iou,
-          max_train=a.max_train, max_val=a.max_val, rotations=a.rotations)
+          max_train=a.max_train, max_val=a.max_val, encoding=a.encoding, rotations=tuple(a.rotations))

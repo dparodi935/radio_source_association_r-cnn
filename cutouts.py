@@ -14,7 +14,10 @@ from torchvision.ops import box_iou
 import glob, re
 import torchvision.transforms.functional as TF
 
-ENCODING_VERSION = "sigma3_rot"      # bump: cache now holds rotated cutouts
+from optical import OpticalTiles, encode_optical
+ 
+
+
 
 # --- folder names, one per catalogue type. Edit to match your disk layout. ---
 DIR_MOSAIC = "mosaics"
@@ -22,6 +25,38 @@ DIR_RAW = "pybdsf_raw"        # proposals come from here (all components)
 DIR_LARGE = "pybdsf_raw_large"    # cutout centres come from here
 DIR_COMP = "final_comp"    # Gaus_id -> Source_Name, the ground-truth grouping
 DIR_CUTOUT = "cutouts"
+DIR_OPTICAL = "optical_tiles"          # folder holding unwise-*-w1-img-m.fits
+
+
+# --- encodings, ie. how the data in each channel is sourced and process --- 
+ENCODINGS = {
+    "radio3":     ("sqrt1_30", "mask3", "mask5"),
+    "radio2_w1":  ("sqrt1_30", "mask5", "w1"),
+    "radio2_w1m": ("sqrt1_30", "mask5", "w1masked"),
+}
+
+ # Which channels each encoding uses, in order.
+#   sqrt1_30  sqrt-stretched 1-30 sigma radio
+#   mask3     binary radio > 3 sigma
+#   mask5     binary radio > 5 sigma
+#   w1        sqrt-stretched 1-30 sigma unWISE W1
+#   w1masked  as w1, but zeroed where radio < 3 sigma (Wu et al. 2019a)
+
+ENCODING_VERSION = "sigma3_rot"      # bump: cache now holds rotated cutouts
+
+
+def encoding_needs_optical(encoding):
+    return any(c.startswith("w1") for c in ENCODINGS[encoding])
+ 
+def n_channels(encoding):
+    return len(ENCODINGS[encoding])
+
+_OPTICAL_SINGLETON = {}
+ 
+def _get_optical_tiles(tile_dir):
+    if tile_dir not in _OPTICAL_SINGLETON:
+        _OPTICAL_SINGLETON[tile_dir] = OpticalTiles(tile_dir)
+    return _OPTICAL_SINGLETON[tile_dir]
 
 
 def _safe(name):
@@ -45,8 +80,14 @@ def discover_mosaics(data_root):
 class SamplesPreprocessor:
     """Builds training samples for ONE mosaic."""
 
-    def __init__(self, mosaic_id, data_root, size=200, max_neighbours=11,
-                 reuse_cutouts=True, rotations=(0,)):
+    def __init__(self, mosaic_id, data_root, size=200, max_neighbours=8,
+                 reuse_cutouts=True, rotations=(0,), encoding="radio3"):
+        
+        if encoding not in ENCODINGS:
+            raise ValueError(f"unknown encoding {encoding!r}; "
+                             f"choose from {sorted(ENCODINGS)}")
+        self.encoding = encoding
+        self.channels = ENCODINGS[encoding]
         self.mosaic_id = mosaic_id
         self.data_root = data_root
         self.size = size
@@ -58,10 +99,13 @@ class SamplesPreprocessor:
         self.extract_data()
         self.open_catalogues()
         
-        """ WRITE UNITS AND MORE HERE. SHOULD ALL BE IN ARCSEC
-        """
-         
+        # optical tiles are shared across mosaics -> load lazily, once
+        self.optical = None
+        if encoding_needs_optical(encoding):
+            self.optical = _get_optical_tiles(os.path.join(data_root, DIR_OPTICAL))
+        self.n_optical_missing = 0
 
+         
     def create_file_paths(self):
         r, m = self.data_root, self.mosaic_id
         self.fits_filepath = os.path.join(r, DIR_MOSAIC, f"mosaic_{m}.fits")
@@ -69,7 +113,8 @@ class SamplesPreprocessor:
         self.large_cat_path = os.path.join(r, DIR_LARGE, f"{m}.fits")
         self.comp_cat_path = os.path.join(r, DIR_COMP, f"{m}.fits")
         self.cutout_dir = os.path.join(
-            r, DIR_CUTOUT, f"{m}_{ENCODING_VERSION}_{self.size}")
+            r, DIR_CUTOUT, f"{m}_{ENCODING_VERSION}_{self.encoding}_{self.size}")
+
         os.makedirs(self.cutout_dir, exist_ok=True)
  
         for p in (self.fits_filepath, self.raw_cat_path,
@@ -269,17 +314,48 @@ class SamplesPreprocessor:
         return idx
 
 
-    def _make_cutout_array(self, cutout, centre_gauss):
-        """(3,H,W) sigma-encoded cutout, or None if unusable."""
-        rms_jy = float(centre_gauss["Isl_rms"]) * 1e-3     # mJy/beam -> Jy/beam
+    def _make_cutout_array(self, cutout, centre_gauss): 
+        '''(C,H,W) encoded cutout, or None if unusable.
+ 
+        Channel set is decided by self.channels. Radio channels are in sigma
+        units above the island rms; the W1 channel is in sigma units above the
+        unWISE tile background, so both are context-independent.
+        '''
+        rms_jy = float(centre_gauss['Isl_rms']) * 1e-3      # mJy/beam -> Jy/beam
         d = np.nan_to_num(cutout.data, nan=0.0, posinf=0.0, neginf=0.0)
         if not np.isfinite(d).any() or rms_jy <= 0 or np.ptp(d) == 0:
             return None
         s = d / rms_jy
-        ch0 = np.sqrt(np.clip((s - 1.0) / 29.0, 0.0, 1.0))
-        ch1 = (s > 3.0).astype(np.float32)
-        ch2 = (s > 5.0).astype(np.float32)
-        return np.stack([ch0, ch1, ch2]).astype(np.float32)
+ 
+        w1 = None
+        if self.optical is not None:
+            #samples from different tiles to create equivalent optical counterpart
+            w1_sigma = self.optical.sample_on_grid(
+                cutout.wcs, d.shape,
+                (float(centre_gauss['RA']), float(centre_gauss['DEC'])))
+            if w1_sigma is None:
+                self.n_optical_missing += 1
+                return None            # drop rather than pad: a zero optical
+                                       # channel would be a silent false negative
+            w1 = encode_optical(w1_sigma)
+ 
+        chans = []
+        for name in self.channels:
+            if name == 'sqrt1_30':
+                chans.append(np.sqrt(np.clip((s - 1.0) / 29.0, 0.0, 1.0)))
+            elif name == 'mask3':
+                chans.append((s > 3.0).astype(np.float32))
+            elif name == 'mask5':
+                chans.append((s > 5.0).astype(np.float32))
+            elif name == 'w1':
+                chans.append(w1)
+            elif name == 'w1masked':
+                chans.append(w1 * (s > 3.0))
+            else:
+                raise ValueError(f'unknown channel {name!r}')
+            
+        return np.stack(chans).astype(np.float32)
+
        
     def generate_samples_list(self, verbose=True):
         raw = self.raw_catalogue
@@ -300,7 +376,7 @@ class SamplesPreprocessor:
             key = str(centre_gauss["Source_Name"])
             filepath = os.path.join(self.cutout_dir, f"{_safe(key)}.npy")
  
-            cutout = Cutout2D(self.data, pixel_pos, self.size)
+            cutout = Cutout2D(self.data, pixel_pos, self.size, wcs=self.coord_system)
             self._write_cutout(cutout, filepath, rms_jy = float(centre_gauss["Isl_rms"]) * 1e-3)
  
             origin = (cutout.origin_original[0], cutout.origin_original[1])
@@ -377,8 +453,13 @@ class SamplesPreprocessor:
                   f"({n_skipped} edge-skipped, {n_nogt} without GT, "
                   f"{n_truncated} neighbour-truncated, "
                   f"{self.n_deblended} deblended dropped, "
-                  f"{self.n_unjoined} comp rows unjoined)"
+                  f"{self.n_unjoined} comp rows unjoined), "
                   f"{self.n_truth_lost/len(samples)} = fraction of true siblings being filtered out")
+            
+            if self.optical is not None:
+                print(f'   optical: {self.n_optical_missing} cutouts dropped '
+                      f'(no W1 tile coverage)')
+
         return samples
     
         
