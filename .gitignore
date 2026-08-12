@@ -9,3 +9,4 @@ cnn_cache/
 inference_outputs/
 training_cutouts_output/
 *.pt
+results.csv
