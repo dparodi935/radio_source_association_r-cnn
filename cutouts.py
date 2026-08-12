@@ -26,7 +26,7 @@ DIR_LARGE = "pybdsf_raw_large"    # cutout centres come from here
 DIR_COMP = "final_comp"    # Gaus_id -> Source_Name, the ground-truth grouping
 DIR_CUTOUT = "cutouts"
 DIR_OPTICAL = "optical_tiles"          # folder holding unwise-*-w1-img-m.fits
-
+DIR_RMS = "rms_mosaics"
 
 # --- encodings, ie. how the data in each channel is sourced and process --- 
 ENCODINGS = {
@@ -112,12 +112,13 @@ class SamplesPreprocessor:
         self.raw_cat_path = os.path.join(r, DIR_RAW, f"{m}.fits")
         self.large_cat_path = os.path.join(r, DIR_LARGE, f"{m}.fits")
         self.comp_cat_path = os.path.join(r, DIR_COMP, f"{m}.fits")
+        self.rms_filepath = os.path.join(r, DIR_RMS, f"mosaic_{m}.fits")
         self.cutout_dir = os.path.join(
             r, DIR_CUTOUT, f"{m}_{ENCODING_VERSION}_{self.encoding}_{self.size}")
 
         os.makedirs(self.cutout_dir, exist_ok=True)
- 
-        for p in (self.fits_filepath, self.raw_cat_path,
+        
+        for p in (self.fits_filepath, self.rms_filepath, self.raw_cat_path,
                   self.large_cat_path, self.comp_cat_path):
             if not os.path.exists(p):
                 raise FileNotFoundError(f"[{m}] missing: {p}")
@@ -125,15 +126,40 @@ class SamplesPreprocessor:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         self.cutout_test_path = os.path.join(script_dir, "training_cutouts_output") # where to save training cutouts (with boxes draw)
 
+    
     def extract_data(self):
         with fits.open(self.fits_filepath) as f:
             self.data = np.squeeze(f[0].data)
             if self.data.ndim != 2:
                 raise ValueError(f"expected 2D image, got {self.data.shape}")
             self.coord_system = WCS(f[0].header).celestial
-            self.coord_scale = proj_plane_pixel_scales(self.coord_system)[1]  # deg/px
+            self.coord_scale = proj_plane_pixel_scales(self.coord_system)[1]
+            self.beam_arcsec = float(f[0].header["BMAJ"]) * 3600.0
+            img_bunit = str(f[0].header.get("BUNIT", "")).strip().upper()
         self.pixel_arcsec = self.coord_scale * 3600.0
-        self.beam_arcsec = float(f[0].header["BMAJ"]) * 3600.0
+
+        # DR2 rms map: per-pixel noise, same grid, same units as the image.
+        # Using this rather than the DR1 catalogue's Isl_rms, because the
+        # catalogue noise was measured on DR1 pixels and we image in DR2.
+        with fits.open(self.rms_filepath) as f:
+            self.rms_data = np.squeeze(f[0].data)
+            self.rms_wcs = WCS(f[0].header).celestial
+            rms_bunit = str(f[0].header.get("BUNIT", "")).strip().upper()
+
+        if self.rms_data.shape != self.data.shape:
+            raise ValueError(
+                f"[{self.mosaic_id}] rms grid {self.rms_data.shape} != "
+                f"image grid {self.data.shape}; reprojection needed")
+        if img_bunit and rms_bunit and img_bunit != rms_bunit:
+            raise ValueError(f"[{self.mosaic_id}] BUNIT mismatch: "
+                             f"image {img_bunit!r} vs rms {rms_bunit!r}")
+
+        finite = self.rms_data[np.isfinite(self.rms_data) & (self.rms_data > 0)]
+        print(f"[{self.mosaic_id}] rms map: median "
+              f"{np.median(finite) * 1e6:.0f} uJy/beam, "
+              f"{100 * (1 - finite.size / self.rms_data.size):.1f}% blank")
+        
+        
         
     def _shape_scale(self, table):
         """Pixels per catalogue shape unit. LoTSS catalogues use arcsec; PyBDSF's
@@ -164,15 +190,30 @@ class SamplesPreprocessor:
         #   Source_Name    == the merged value-added source (our grouping label)
         comp_names = np.asarray(comp["Component_Name"]).astype(str)
         va_names = np.asarray(comp["Source_Name"]).astype(str)
- 
-        # exclude deblended entries: one component split into several sources
+
+
+        # exclude bright-galaxy associations (nearby galaxies grouped by 2MASX
+        # ellipse: many arcmin across, can never fit a 300" cutout) and
+        # deblended entries (one component split into several sources).
+        keep = np.ones(len(comp), bool)
+
+        if "ID_flag" in comp.colnames:
+            flag = np.asarray(comp["ID_flag"], int)
+            bright_gal = np.isin(flag, [2, 22])
+            self.n_bright_gal = int(bright_gal.sum())
+            keep &= ~bright_gal
+        else:
+            self.n_bright_gal = 0
+
         if "Deblended_from" in comp.colnames:
             deb = np.asarray(comp["Deblended_from"]).astype(str)
-            keep = (deb == "") | (deb == "--") | (deb == "nan")
-            self.n_deblended = int((~keep).sum())
-            comp_names, va_names = comp_names[keep], va_names[keep]
+            deblended = ~((deb == "") | (deb == "--") | (deb == "nan"))
+            self.n_deblended = int(deblended.sum())
+            keep &= ~deblended
         else:
             self.n_deblended = 0
+
+        comp_names, va_names = comp_names[keep], va_names[keep]
  
         self.source_of = dict(zip(comp_names.tolist(), va_names.tolist()))
  
@@ -206,6 +247,9 @@ class SamplesPreprocessor:
                 f"cutout is only {self.size} px — check the Maj/Min units")
 
         self.n_truth_lost = 0
+        self.n_multi_truth = 0
+        self.n_lost_filtered = 0    # filter removed it
+        self.n_lost_outside = 0     # not in the cutout
 
     
     def _rotate_point(self, x, y, angle_deg):
@@ -292,68 +336,79 @@ class SamplesPreprocessor:
         return table[keep]
 
 
-    def _gt_member_indices(self, centre_gauss, nb):
-        """Indices into [centre] + list(nb) of the true association.
-        Returns [] if the centre has no entry in the component catalogue."""
+    def _gt_member_indices(self, centre_gauss, nb, all_in_window):
+        """(indices into [centre]+nb, number of true members in the catalogue)."""
         key = str(centre_gauss["Source_Name"])
         va_name = self.source_of.get(key)
         if va_name is None:
-            return []
+            return [], 0
         member_keys = set(self.members_of.get(va_name, []))
         if not member_keys:
-            return []
-        idx = [0]                                          # centre always
+            return [], 0
+        idx = [0]
         for i, r in enumerate(nb):
             if str(r["Source_Name"]) in member_keys:
                 idx.append(i + 1)
-                
+        
         n_true = len(member_keys)
-        if n_true > len(idx):
-            self.n_truth_lost += 1
-            
-        return idx
+        
+        found = {str(r["Source_Name"]) for r in nb}
+        in_window = {str(r["Source_Name"]) for r in all_in_window}
+        missing = member_keys - found - {key}
+        self.n_lost_filtered += len(missing & in_window)      # filter removed it
+        self.n_lost_outside += len(missing - in_window)       # not in the cutout
+
+        if len(missing - in_window) > 3:
+            print(f"   {key}: {n_true} true members, {len(missing-in_window)} outside window")
+
+        return idx, len(member_keys)
+    
+
+    
+    def _cutout_centre_radec(self, cutout):
+        ny, nx = cutout.data.shape
+        ra, dec = cutout.wcs.all_pix2world(nx / 2.0, ny / 2.0, 0)
+        return float(ra), float(dec)
 
 
-    def _make_cutout_array(self, cutout, centre_gauss): 
-        '''(C,H,W) encoded cutout, or None if unusable.
- 
-        Channel set is decided by self.channels. Radio channels are in sigma
-        units above the island rms; the W1 channel is in sigma units above the
-        unWISE tile background, so both are context-independent.
-        '''
-        rms_jy = float(centre_gauss['Isl_rms']) * 1e-3      # mJy/beam -> Jy/beam
+    def _make_cutout_array(self, cutout, rms_cutout):
+        """(C,H,W) encoded cutout, or None if unusable.
+
+        Radio channels are in sigma units from the DR2 rms map (per pixel, so
+        a source near a noisy mosaic edge is correctly harder to detect).
+        """
         d = np.nan_to_num(cutout.data, nan=0.0, posinf=0.0, neginf=0.0)
-        if not np.isfinite(d).any() or rms_jy <= 0 or np.ptp(d) == 0:
+        rms = rms_cutout.data
+        good = np.isfinite(rms) & (rms > 0)
+        if good.mean() < 0.5 or not np.isfinite(d).any() or np.ptp(d) == 0:
             return None
-        s = d / rms_jy
- 
+
+        s = np.zeros_like(d, dtype=np.float32)
+        np.divide(d, rms, out=s, where=good)      # blank rms -> 0 sigma
+
         w1 = None
         if self.optical is not None:
-            #samples from different tiles to create equivalent optical counterpart
             w1_sigma = self.optical.sample_on_grid(
-                cutout.wcs, d.shape,
-                (float(centre_gauss['RA']), float(centre_gauss['DEC'])))
+                cutout.wcs, d.shape, self._cutout_centre_radec(cutout))
             if w1_sigma is None:
                 self.n_optical_missing += 1
-                return None            # drop rather than pad: a zero optical
-                                       # channel would be a silent false negative
+                return None
             w1 = encode_optical(w1_sigma)
- 
+
         chans = []
         for name in self.channels:
-            if name == 'sqrt1_30':
+            if name == "sqrt1_30":
                 chans.append(np.sqrt(np.clip((s - 1.0) / 29.0, 0.0, 1.0)))
-            elif name == 'mask3':
+            elif name == "mask3":
                 chans.append((s > 3.0).astype(np.float32))
-            elif name == 'mask5':
+            elif name == "mask5":
                 chans.append((s > 5.0).astype(np.float32))
-            elif name == 'w1':
+            elif name == "w1":
                 chans.append(w1)
-            elif name == 'w1masked':
+            elif name == "w1masked":
                 chans.append(w1 * (s > 3.0))
             else:
-                raise ValueError(f'unknown channel {name!r}')
-            
+                raise ValueError(f"unknown channel {name!r}")
         return np.stack(chans).astype(np.float32)
 
        
@@ -374,11 +429,17 @@ class SamplesPreprocessor:
                 continue
  
             key = str(centre_gauss["Source_Name"])
-            filepath = os.path.join(self.cutout_dir, f"{_safe(key)}.npy")
  
-            cutout = Cutout2D(self.data, pixel_pos, self.size, wcs=self.coord_system)
-            self._write_cutout(cutout, filepath, rms_jy = float(centre_gauss["Isl_rms"]) * 1e-3)
- 
+            cutout = Cutout2D(self.data, pixel_pos, self.size,
+                              wcs=self.coord_system)
+            rms_cutout = Cutout2D(self.rms_data, pixel_pos, self.size,
+                                  wcs=self.rms_wcs)
+
+            base_img = self._make_cutout_array(cutout, rms_cutout)
+            if base_img is None:
+                n_skipped += 1
+                continue
+             
             origin = (cutout.origin_original[0], cutout.origin_original[1])
             source_centre = (pixel_pos[0] - origin[0], pixel_pos[1] - origin[1])
  
@@ -396,15 +457,13 @@ class SamplesPreprocessor:
                 [[pixel_pos[0] - origin[0], pixel_pos[1] - origin[1]]] +
                 [[float(r["Xposn"]) - origin[0], float(r["Yposn"]) - origin[1]]
                  for r in nb], dtype=float)
-
+            
             # true association, as indices into `members`
-            gt_idx = self._gt_member_indices(centre_gauss, nb)
-
-            base_img = self._make_cutout_array(cutout, centre_gauss)
-            if base_img is None:
-
-                n_skipped += 1
-                continue
+            gt_idx, n_true = self._gt_member_indices(centre_gauss, nb, raw[in_bounds])
+            if n_true > 1:
+                self.n_multi_truth += 1  # real number of multi-component sources
+                if len(gt_idx) < n_true:
+                    self.n_truth_lost += 1   # number of sources where we don't capture all the components
 
             for angle in self.rotations:
                 img = self._rotate_image(base_img, angle)
@@ -455,7 +514,15 @@ class SamplesPreprocessor:
                   f"{self.n_deblended} deblended dropped, "
                   f"{self.n_unjoined} comp rows unjoined), "
                   f"{self.n_truth_lost/len(samples)} = fraction of true siblings being filtered out")
+            print(f"[{self.mosaic_id}] centres={len(self.centre_catalogue)} "
+                f"rotations={len(self.rotations)} samples={len(samples)}")
             
+            if self.n_multi_truth:
+                print(f"   truth incomplete: {self.n_truth_lost}/"
+                      f"{self.n_multi_truth} multi-component centres")
+                print(f"n_lost_filtered = {self.n_lost_filtered}")
+                print(f"n_lost_outside = {self.n_lost_outside}")
+
             if self.optical is not None:
                 print(f'   optical: {self.n_optical_missing} cutouts dropped '
                       f'(no W1 tile coverage)')
