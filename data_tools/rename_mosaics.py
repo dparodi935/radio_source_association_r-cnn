@@ -2,7 +2,7 @@ import os
 from astropy.io import fits
 
 script_dir = os.path.dirname(os.path.realpath(__file__))
-mosaic_folderpath = os.path.join(script_dir,"..","cnn_data","new_mosaics")
+mosaic_folderpath = os.path.join(script_dir,"..","..","cnn_data","new_mosaics")
 
 mosaic_list = os.listdir(mosaic_folderpath)
 
