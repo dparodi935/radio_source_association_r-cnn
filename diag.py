@@ -26,7 +26,7 @@ def main():
     ap.add_argument("--weights", default=os.path.join(here, "weights.pt"))
     ap.add_argument("--split", default="val")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--limit", type=int, default=300)
+    ap.add_argument("--limit", type=int, default=None)
     a = ap.parse_args()
 
     device = torch.device("cpu")
@@ -34,21 +34,26 @@ def main():
     meta = ckpt if isinstance(ckpt, dict) and "state_dict" in ckpt else {}
     size = meta.get("size", 200)
     max_nb = meta.get("max_neighbours", 11)
-    ncls = meta.get("num_classes", 3)
-    nch = meta.get("in_channels", 1)
+    ncls = meta.get("num_classes", 2)
+    nch = meta.get("in_channels", 3)
+    encoding = meta.get("encoding", "radio3")        # ADD
+
     sd = meta.get("state_dict", ckpt)
     print(f"checkpoint: size={size} max_neighbours={max_nb}")
 
     tr, va, te = split_mosaics(a.data_root, seed=a.seed)
     ids = {"train": tr, "val": va, "test": te}[a.split]
     ds = RadioGalaxyDataset(a.data_root, ids, size=size, max_neighbours=max_nb,
-                            verbose=True)
+                            encoding=encoding, verbose=True)    # ADD encoding
 
     model = TinyFastRCNN(num_classes=ncls, in_channels=nch).to(device)
     model.load_state_dict(sd)
     model.eval()
 
-    n = min(a.limit, len(ds))
+    if a.limit is not None:
+        n = min(a.limit, len(ds))
+    else:
+        n = len(ds)
     oracle_hit = 0          # a proposal with IoU>0.9 vs GT exists
     centre_is_truth = 0     # that proposal is #0 (no association)
     model_correct = 0       # model picks a proposal with IoU>0.9
