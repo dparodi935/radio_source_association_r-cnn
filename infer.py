@@ -11,7 +11,7 @@ from collections import defaultdict
 from dataset import RadioGalaxyDataset, split_mosaics
 from losses import decode_boxes
 from model import TinyFastRCNN
-
+from cutouts import DIR_INFER_OUTPUTS
 
 CLASS_NAMES = {0: "background", 1: "source"}
 CLASS_COLORS = {1: "lime"}
@@ -75,6 +75,37 @@ def count_components(box, neighbour_xy):
               (xy[:, 1] >= y1) & (xy[:, 1] <= y2))
     return 1 + int(inside.sum())
 
+from scipy.stats import chi2
+
+def gap_heterogeneity(per):
+    """Q test: is the per-mosaic gap spread more than sampling noise?"""
+    gaps, vars_, ns = [], [], []
+    all_d = []
+    for mid in sorted(per):
+        cf = np.asarray(per[mid]["cf"], int)
+        bf = np.asarray(per[mid]["bf"], int)
+        d = cf - bf                                  # -1, 0, +1 per cutout
+        all_d.append(d)
+        gaps.append(d.mean())
+        vars_.append(d.var(ddof=1) / len(d))
+        ns.append(len(d))
+
+    gaps, vars_ = np.array(gaps), np.array(vars_)
+    d_all = np.concatenate(all_d)
+    gap_pooled = d_all.mean()
+    se_pooled = np.sqrt(d_all.var(ddof=1) / len(d_all))
+
+    k = len(gaps)
+    Q = float(((gaps - gap_pooled) ** 2 / vars_).sum())
+    crit = chi2.ppf(0.95, k - 1)
+
+    print(f"\npooled gap: {gap_pooled:+.1%} +/- {se_pooled:.1%} (paired SE)")
+    print(f"  95% CI: [{gap_pooled - 1.96*se_pooled:+.1%}, "
+          f"{gap_pooled + 1.96*se_pooled:+.1%}]")
+    print(f"heterogeneity Q = {Q:.2f}, df = {k-1}, "
+          f"chi2 95th pct = {crit:.2f} -> "
+          f"{'mosaics genuinely differ' if Q > crit else 'consistent with one common gap'}")
+    return gap_pooled, se_pooled, Q
 
 def evaluate(model, dataset, device, use_regression=False, verbose_n=10,
              iou_correct=0.9):
@@ -83,9 +114,12 @@ def evaluate(model, dataset, device, use_regression=False, verbose_n=10,
     The GAP (accuracy - baseline) is the figure of merit: a high accuracy means
     nothing if predicting 'never associate' scores the same.
     """ 
-    per = defaultdict(lambda: {"n": 0, "correct": 0, "baseline": 0})
+    
+    per = defaultdict(lambda: {"n": 0, "correct": 0, "baseline": 0,
+                               "cf": [], "bf": []})       # flag lists
+
     correct = baseline = with_gt = too_many = too_few = 0
-    n_multi = multi_correct = 0
+    n_multi = multi_correct = multi_base = 0
  
     for i in range(len(dataset)):
         image, proposals, gt_boxes, gt_labels = dataset[i]
@@ -100,11 +134,19 @@ def evaluate(model, dataset, device, use_regression=False, verbose_n=10,
  
         gt = [float(v) for v in gt_boxes[0]]
         iou, a_pred, a_gt = _iou([float(v) for v in box], gt)
+        b_iou, _, _ = _iou([float(v) for v in proposals[0]], gt)
+        
+        is_correct = iou > iou_correct
         is_multi = bool(len(gt_labels) and int(gt_labels[0]) == 2)
+        is_base = b_iou > iou_correct
+        
+        per[mid]["cf"].append(is_correct)
+        per[mid]["bf"].append(is_base)
+
         if is_multi:
             n_multi += 1
  
-        if iou > iou_correct:
+        if is_correct:
             correct += 1
             per[mid]["correct"] += 1
             if is_multi:
@@ -114,15 +156,14 @@ def evaluate(model, dataset, device, use_regression=False, verbose_n=10,
         else:
             too_few += 1
  
-        b_iou, _, _ = _iou([float(v) for v in proposals[0]], gt)
-        if b_iou > iou_correct:
+        if is_base:
             baseline += 1
             per[mid]["baseline"] += 1
- 
+
         if i < verbose_n:
             print(f"  [{i}] score={score:.3f} prop={idx:4d} IoU={iou:.3f}"
                   f"{'  MC' if is_multi else ''}")
- 
+        
     if with_gt == 0:
         print("no samples with ground truth")
         return {}
@@ -153,7 +194,9 @@ def evaluate(model, dataset, device, use_regression=False, verbose_n=10,
               f"min {gaps.min():+.1%}, max {gaps.max():+.1%}")
         if abs(gaps.mean()) < gap_std:
             print("  ** spread exceeds the mean gap: not yet a measurable effect **")
- 
+    
+    gap_heterogeneity(per)
+    
     return {
         "n": with_gt, "accuracy": acc, "baseline": base, "gap": acc - base,
         "gap_sd": gap_std, "too_many": too_many / with_gt,
@@ -259,8 +302,10 @@ def main():
                     help="must match the seed used in train.py")
     ap.add_argument("--use-regression", action="store_true",
                     help="apply box deltas; off by default (Mostert disables it)")
-    ap.add_argument("--output-dir", default=os.path.join(here, "inference_outputs"))
+    ap.add_argument("--output-dir", default=DIR_INFER_OUTPUTS)
     a = ap.parse_args()
+    
+    output_dir = os.path.join(a.data_root, a.output_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -299,7 +344,7 @@ def main():
     res = evaluate(model, ds, device, use_regression=a.use_regression)
     log_result(os.path.join(here, "results.csv"), res, ckpt, a.split)
     
-    os.makedirs(a.output_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     
     # pick interesting samples rather than the first N
     order = sorted(range(len(ds)),
@@ -317,12 +362,12 @@ def main():
         n_true = count_components(gt_boxes[0], nb_xy) if len(gt_boxes) else 0
 
         visualize(image, box, gt_boxes, score, label,
-                  os.path.join(a.output_dir, f"sample_{n:04d}.png"),
+                  os.path.join(output_dir, f"sample_{n:04d}.png"),
                   encoding,
                   title=f"{ds.samples[i]['source_name']}\n"
                         f"pred {n_pred} comp / true {n_true}",
                   n_pred=n_pred)
-    print(f"figures -> {a.output_dir}/")
+    print(f"figures -> {output_dir}/")
     
     
 if __name__ == "__main__":
