@@ -1,5 +1,4 @@
 from astropy.nddata import Cutout2D
-from astropy.coordinates import SkyCoord
 from astropy.table import Table
 from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
@@ -10,7 +9,6 @@ from itertools import combinations
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import torch
-from torchvision.ops import box_iou
 import glob, re
 import torchvision.transforms.functional as TF
 
@@ -27,12 +25,16 @@ DIR_COMP = "final_comp"    # Gaus_id -> Source_Name, the ground-truth grouping
 DIR_CUTOUT = "cutouts"
 DIR_OPTICAL = "optical_tiles"          # folder holding unwise-*-w1-img-m.fits
 DIR_RMS = "rms_mosaics"
+DIR_CUTOUT_TEST = "training_cutouts"
+DIR_INFER_OUTPUTS = "inference_outputs"
 
 # --- encodings, ie. how the data in each channel is sourced and process --- 
 ENCODINGS = {
     "radio3":     ("sqrt1_30", "mask3", "mask5"),
     "radio2_w1":  ("sqrt1_30", "mask5", "w1"),
     "radio2_w1m": ("sqrt1_30", "mask5", "w1masked"),
+    "radio3_w1":  ("sqrt1_30", "mask3", "mask5", "w1"),
+    "radio3_w1m":  ("sqrt1_30", "mask3", "mask5", "w1masked")
 }
 
  # Which channels each encoding uses, in order.
@@ -113,18 +115,16 @@ class SamplesPreprocessor:
         self.large_cat_path = os.path.join(r, DIR_LARGE, f"{m}.fits")
         self.comp_cat_path = os.path.join(r, DIR_COMP, f"{m}.fits")
         self.rms_filepath = os.path.join(r, DIR_RMS, f"mosaic_{m}.fits")
-        self.cutout_dir = os.path.join(
-            r, DIR_CUTOUT, f"{m}_{ENCODING_VERSION}_{self.encoding}_{self.size}")
+        self.cutout_dir = os.path.join(r, DIR_CUTOUT, f"{m}_{ENCODING_VERSION}_{self.encoding}_{self.size}")
+        self.cutouts_test_dir = os.path.join(r, DIR_CUTOUT_TEST, f"{ENCODING_VERSION}_{self.encoding}")
 
         os.makedirs(self.cutout_dir, exist_ok=True)
-        
+        os.makedirs(self.cutouts_test_dir, exist_ok=True)
+
         for p in (self.fits_filepath, self.rms_filepath, self.raw_cat_path,
                   self.large_cat_path, self.comp_cat_path):
             if not os.path.exists(p):
                 raise FileNotFoundError(f"[{m}] missing: {p}")
-
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        self.cutout_test_path = os.path.join(script_dir, "training_cutouts_output") # where to save training cutouts (with boxes draw)
 
     
     def extract_data(self):
@@ -422,7 +422,7 @@ class SamplesPreprocessor:
         raw_key = np.asarray(raw["Source_Name"]).astype(str)
         half = self.size / 2.0
 
-        for centre_gauss in self.centre_catalogue:
+        for idx, centre_gauss in enumerate(self.centre_catalogue):
             pixel_pos = (float(centre_gauss["Xposn"]), float(centre_gauss["Yposn"]))
             if not self._in_image_bounds(pixel_pos):
                 n_skipped += 1
@@ -505,15 +505,18 @@ class SamplesPreprocessor:
                     "neighbour_xy": nb_xy_rot.astype(np.float32),
                     "n_dropped": n_dropped,
                 })
- 
+
+                if idx % 50 == 0:
+                    self.visualize_cutout(img, proposals, gt_box, f"{key}_r{angle}", gt_label,
+                                          channels=self.channels)    
+                
         if verbose:
             total = len(self.centre_catalogue)
             print(f"[{self.mosaic_id}] {len(samples)}/{total} samples "
                   f"({n_skipped} edge-skipped, {n_nogt} without GT, "
                   f"{n_truncated} neighbour-truncated, "
                   f"{self.n_deblended} deblended dropped, "
-                  f"{self.n_unjoined} comp rows unjoined), "
-                  f"{self.n_truth_lost/len(samples)} = fraction of true siblings being filtered out")
+                  f"{self.n_unjoined} comp rows unjoined)")
             print(f"[{self.mosaic_id}] centres={len(self.centre_catalogue)} "
                 f"rotations={len(self.rotations)} samples={len(samples)}")
             
@@ -530,52 +533,52 @@ class SamplesPreprocessor:
         return samples
     
         
-    def visualize_cutout(self, image_data, proposals, gt_boxes, gaus_id, gt_label):
-        """Helper method to plot the image, proposal boxes, and ground truth boxes."""
-        fig, ax = plt.subplots(figsize=(8, 8))
-        
-        # Display the image (origin='lower' keeps standard astronomical orientation)
-        ax.imshow(image_data, cmap="gray", origin="lower")
-        
-        # Determine the primary Ground Truth box for IoU calculation (if one exists)
+    def visualize_cutout(self, image_data, proposals, gt_boxes, name, gt_label,
+                     channels=None):
+        channels = channels or ("sqrt1_30",)
+        bg_idx = channels.index("sqrt1_30") if "sqrt1_30" in channels else 0
+        w1_idx = channels.index("w1") if "w1" in channels else None
+        w1m_idx = channels.index("w1masked") if "w1masked" in channels else None
+
+        panels_spec = [(bg_idx, "gray", "radio")]
+        if w1_idx is not None:
+            panels_spec.append((w1_idx, "viridis", "W1"))
+        if w1m_idx is not None:
+            panels_spec.append((w1m_idx, "viridis", "W1 masked"))
+
+        ncols = len(panels_spec)
+        fig, axes = plt.subplots(1, ncols, figsize=(8 * ncols, 8))
+        axes = [axes] if ncols == 1 else list(axes)
+
         primary_gt_box = None
         if gt_boxes is not None and len(gt_boxes) > 0:
             primary_gt_box = gt_boxes[0] if gt_boxes.ndim == 2 else gt_boxes
-        
-        # 1. Plot PyBDSF Proposals (Cyan, Dashed, Thinner) and label with IoU
-        for box in proposals:
-            x1, y1, x2, y2 = box
-            rect = patches.Rectangle((x1, y1), x2 - x1, y2 - y1, 
-                                     linewidth=1, edgecolor='cyan', 
-                                     facecolor='none', linestyle='--', alpha=0.7)
-            ax.add_patch(rect)
-            
-            # Calculate and plot IoU if a Ground Truth box exists
-            iou_text = "IoU: N/A"
-            if primary_gt_box is not None:
-                iou = self._calculate_iou(box, primary_gt_box)
-                iou_text = f"IoU: {iou:.2f}"
-            
-            # Place IoU text at the top-left of the proposal to avoid clashing with the GT label
-            ax.text(x1, y2, iou_text, color='cyan', fontsize=8, va="bottom", ha="left")
-            
-        # 2. Plot Ground Truth Box (Lime Green, Solid, Thicker)
-        if gt_boxes is not None and len(gt_boxes) > 0:
-            # Note: gt_boxes might be shape (1, 4) or empty (0, 4)
-            if gt_boxes.ndim == 1:
-                gt_boxes = [gt_boxes]  # Ensure it's iterable if 1D
-            for box in gt_boxes:
-                x1, y1, x2, y2 = box
-                rect = patches.Rectangle((x1, y1), x2 - x1, y2 - y1, 
-                                         linewidth=2.5, edgecolor='lime', 
-                                         facecolor='none')
-                ax.add_patch(rect)
-                ax.text(x1, y1 - 2, f"GT Label: {gt_label}", 
-                        color='lime', fontsize=10, va="top")
 
-        ax.set_title(f"Source ID: {gaus_id} | {len(proposals)} Proposals")
-        ax.axis("off")
-        filepath = os.path.join(self.cutout_test_path,f"{gaus_id}.png")
-        plt.savefig(f"{filepath}")
-        plt.close(fig) # Adding this prevents Matplotlib from eating up all your RAM!
-        
+        for ax, (idx, cmap, label) in zip(axes, panels_spec):
+            ax.imshow(image_data[idx], cmap=cmap, origin="lower")
+
+            for box in proposals:
+                x1, y1, x2, y2 = box
+                ax.add_patch(patches.Rectangle((x1, y1), x2 - x1, y2 - y1,
+                                            linewidth=1, edgecolor="cyan",
+                                            facecolor="none", linestyle="--",
+                                            alpha=0.7))
+
+            if gt_boxes is not None and len(gt_boxes) > 0:
+                boxes = [gt_boxes] if gt_boxes.ndim == 1 else gt_boxes
+                for box in boxes:
+                    x1, y1, x2, y2 = box
+                    ax.add_patch(patches.Rectangle((x1, y1), x2 - x1, y2 - y1,
+                                                linewidth=2.5, edgecolor="lime",
+                                                facecolor="none"))
+                    if ax is axes[0]:
+                        ax.text(x1, y1 - 2, f"GT Label: {gt_label}",
+                                color="lime", fontsize=10, va="top")
+
+            ax.set_title(label)
+            ax.axis("off")
+
+        fig.suptitle(f"Source ID: {name} | {len(proposals)} Proposals")
+        filepath = os.path.join(self.cutouts_test_dir, f"{name}.png")
+        plt.savefig(filepath, bbox_inches="tight")
+        plt.close(fig)
