@@ -84,7 +84,7 @@ def train(data_root, out_path, num_classes=2, size=200,
           max_neighbours=8, batch_size=4, num_epochs=20, lr=1e-4,
           fg_iou=0.8, bg_iou=0.5, max_train=None, max_val=None,
           rotations=(0, 25, 50, 100), encoding="radio3",
-          seed=42, device=None):
+          seed=42, device=None, torch_seed=0):
 
     in_channels = n_channels(encoding)      # derived, not passed
     print(f"encoding: {encoding} -> {in_channels} channels "
@@ -107,6 +107,7 @@ def train(data_root, out_path, num_classes=2, size=200,
                         collate_fn=collate_fn)
     
     val_dl = None
+    # loads validation dataset
     if val_ids:
         val_ds = RadioGalaxyDataset(data_root, val_ids, size=size,
                                 max_neighbours=max_neighbours,
@@ -114,6 +115,8 @@ def train(data_root, out_path, num_classes=2, size=200,
         val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
                             collate_fn=collate_fn)
 
+    torch.manual_seed(torch_seed)
+    
     model = TinyFastRCNN(num_classes=num_classes, in_channels=in_channels).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -130,6 +133,8 @@ def train(data_root, out_path, num_classes=2, size=200,
         line = (f"epoch {epoch+1}/{num_epochs}  train loss {c:.4f} "
                 f"top1 {pos/max(neg,1):.1%} ({pos}/{neg})")
 
+        # tests model on validation dataset, but does not update weights from this
+        # this is to guard against overtraining
         if val_dl is not None:
             vc, vr, vpos, vneg, _ = run_epoch(model, val_dl, None, num_classes,
                                               fg_iou, bg_iou, device)
@@ -168,9 +173,11 @@ if __name__ == "__main__":
     ap.add_argument("--max-val", type=int, default=None)
     ap.add_argument("--num-classes", type=int, default=2)
     ap.add_argument("--rotations", type=int, nargs="+", default=[0, 25, 50, 100])
+    ap.add_argument("--torch-seed", type=int, default=0)
     a = ap.parse_args()
 
     train(a.data_root, a.out, num_classes=a.num_classes, size=a.size,
           max_neighbours=a.max_neighbours, batch_size=a.batch_size,
           num_epochs=a.epochs, lr=a.lr, fg_iou=a.fg_iou, bg_iou=a.bg_iou,
-          max_train=a.max_train, max_val=a.max_val, encoding=a.encoding, rotations=tuple(a.rotations))
+          max_train=a.max_train, max_val=a.max_val, encoding=a.encoding, 
+          rotations=tuple(a.rotations), torch_seed=a.torch_seed)
