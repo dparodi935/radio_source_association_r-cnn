@@ -19,7 +19,6 @@ def main():
     # 1. Load the catalog ONCE (Saves a ton of time!)
     print(f"Loading catalog: {args.catalog}")
     cat = Table.read(args.catalog, format='fits')
-    threshold_arcsec = 15.0
     
     # 2. Get list of all FITS files in the directory
     image_files = [f for f in os.listdir(args.image_dir) if f.endswith('.fits')]
@@ -31,8 +30,8 @@ def main():
     total_sum = 0
     
     warned_list = []
-    warn_limit = 400
-    if check_brightness: warn_limit = 100
+    WARN_LIMIT = 400
+    if check_brightness: WARN_LIMIT = 100
     # 3. Loop through the images
     for image_name in image_files:
         image_path = os.path.join(args.image_dir, image_name)
@@ -40,12 +39,12 @@ def main():
         
         try:
             # Mask
-            filtered_sources = filter(cat, image_path, threshold_arcsec, check_size=check_size, check_brightness=check_brightness)
+            filtered_sources = filter(cat, image_path, check_size=check_size, check_brightness=check_brightness)
 
             total_sum += len(filtered_sources)
             print(f"Sources after filter: {len(filtered_sources)}")
             
-            if len(filtered_sources) < warn_limit :
+            if len(filtered_sources) < WARN_LIMIT :
                 warned_list.append(image_name)
                 print("WARNING: Small number of sources. Check that the catalog fully covers the image's area")
             
@@ -54,7 +53,7 @@ def main():
 
     print("\n\n======================================================================")
     print(f"Total number of Sources after filter: {total_sum}")
-    print(f"Following mosaics had less than {warn_limit} sources: {warned_list}")
+    print(f"Following mosaics had less than {WARN_LIMIT} sources: {warned_list}")
     print("======================================================================")
 
     

@@ -2,18 +2,12 @@
 from collections import defaultdict
 import numpy as np
 from astropy.table import Table
-import os
+import os, sys
 import glob, re
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # add the folder 'test_cnn' to  the sys path
 
-
-
-# --- folder names, one per catalogue type. Edit to match your disk layout. ---
-DIR_MOSAIC = "mosaics"
-DIR_RAW = "pybdsf_raw"        # proposals come from here (all components)
-DIR_LARGE = "pybdsf_raw_large"    # cutout centres come from here
-DIR_COMP = "final_comp"    # Gaus_id -> Source_Name, the ground-truth grouping
-DIR_CUTOUT = "cutouts"
+from cutouts import discover_mosaics, DIR_MOSAIC, DIR_RAW, DIR_COMP
 
 def discover_mosaics(data_root):
     """Returns the sorted RA_DEC ids for every mosaic present on disk."""

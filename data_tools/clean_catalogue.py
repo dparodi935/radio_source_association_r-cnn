@@ -1,13 +1,16 @@
-import numpy as np
-from astropy.table import Table
-
+ 
 """Drops any sources ith NaN in their row
 """
 
+import numpy as np
+from astropy.table import Table
+import os
+
 # Load your processed catalog
-path = "C:\\Users\\dp271\\Documents\\2026_Internship\\dr1_catalogues"
+data_root = os.path.join("..","..","cnn_data")
+path = os.path.join(data_root, "raw_dr1_catalogues")
 cat_name = "final_source_cat"
-cat = Table.read(f"{path}\\{cat_name}.fits", format='fits')
+cat = Table.read(os.path.join(path, f"{cat_name}.fits"), format='fits')
   
 # Create a boolean mask for rows with valid numeric values
 valid_mask = (
@@ -21,5 +24,5 @@ valid_mask = (
 clean_cat = cat[valid_mask]
 
 # 3. Save as a clean FITS file
-clean_cat.write(f"{path}\\{cat_name}_ds9.fits", format='fits', overwrite=True)
+clean_cat.write(os.path.join(path, f"{cat_name}_ds9.fits"), format='fits', overwrite=True)
 

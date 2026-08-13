@@ -1,3 +1,5 @@
+""" CLI tool to read the columns and the corresponding units in the header of a fits file
+"""
 from astropy.table import Table
 import sys 
 from tabulate import tabulate

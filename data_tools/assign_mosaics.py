@@ -8,7 +8,7 @@ source (with a margin so a full cutout fits), take the one whose centre is
 nearest. Sources contained by no mosaic are dropped.
 
 This replaces nearest-centre-only assignment, which handed edge mosaics huge
-numbers of sources lying outside their images -- those then showed up as
+numbers of sources lying outside their images - those then showed up as
 'edge-skipped' during preprocessing and their siblings fell out of frame,
 degrading the ground truth.
 """

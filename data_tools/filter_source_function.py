@@ -2,9 +2,12 @@ import numpy as np
 from astropy.io import fits
 from astropy.wcs import WCS
 
+threshold_arcsec = 15.0
+threshold_flux = 10.0
 
-def filter(cat, image_path, threshold_arcsec, check_pos=True, check_size=False, check_brightness=False):
-    """Takes in a catalogue and an image, and returns a filtered catalogue containing only sources within the image 
+
+def filter(cat, image_path, check_pos=True, check_size=False, check_brightness=False):
+    """Takes in a catalogue and an image, and returns a filtered catalogue. containing only sources within the image 
     and with a major axis greater than threshold_arcsec. Assumes units of arcseconds
 
     Args:
@@ -13,6 +16,7 @@ def filter(cat, image_path, threshold_arcsec, check_pos=True, check_size=False, 
         threshold_arcsec (float): _description_
         check_pos (bool): Whether or not sources outside the image are filtered out
         check_size (bool): Whether or not 'small' sources are filtered out
+        check_brightness (bool): Whether or not 'faint' sources are filtered out
 
     Returns:
         _type_: _description_
@@ -20,7 +24,6 @@ def filter(cat, image_path, threshold_arcsec, check_pos=True, check_size=False, 
     print(f"Loading image: {image_path}")
     with fits.open(image_path) as hdul:
         header = hdul[0].header
-        data_shape = hdul[0].data.shape
         wcs = WCS(header).celestial
     
     print(f"Sources in original catalog: {len(cat)}")
@@ -60,7 +63,7 @@ def filter(cat, image_path, threshold_arcsec, check_pos=True, check_size=False, 
             filtered_cat = filtered_cat[filtered_cat['Maj'] > threshold_arcsec]
         
         if check_brightness:
-            sel = (np.asarray(filtered_cat["Total_flux"], float) > 10.0)
+            sel = (np.asarray(filtered_cat["Total_flux"], float) > threshold_flux)
             filtered_cat = filtered_cat[sel]
 
     else:

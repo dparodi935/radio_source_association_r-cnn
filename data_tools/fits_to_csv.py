@@ -1,5 +1,9 @@
+""" CLI tool to convert fits files to csv
+"""
+
 from astropy.table import Table
 import sys 
+
 
 if len(sys.argv) < 2:
     print("ERROR: No file input")
