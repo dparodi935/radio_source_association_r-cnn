@@ -1,7 +1,7 @@
 Contains scripts to process data
 
 ## Process
-[Images and catalogues for DR1](https://lofar-surveys.org/dr1_release.html)
+[Images and catalogues for DR1](https://lofar-surveys.org/dr1_release.html)    
 
 [Images and catalogues for DR2](https://lofar-surveys.org/dr2_release.html)
 
@@ -17,9 +17,10 @@ Rename these catalogues to something more workable.
 
 
 ### Download from the DR2 website:
-First, search for 'Hetdex' in the mosaics list, and download the following columns:\
-**Full-res mosaics** - Image data \
-**Full-res rms map** - Noise maps
+First, search for 'Hetdex' in the mosaics list, and download the following columns:
+
+**Full-res mosaics** - Image data.  
+**Full-res rms map** - Noise maps.
 
 Note that the DR1 catalogues do not fully cover the DR2 Hetdex regions, but training and inference is based off the PyBDSF catalogue, so the only side effect is that some mosaics will have significantly fewer sources than others. 
 
