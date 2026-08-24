@@ -4,5 +4,6 @@ __pycache__/
 
 # training artifacts
 runs/
+test_results/
 *.pt
 results.csv

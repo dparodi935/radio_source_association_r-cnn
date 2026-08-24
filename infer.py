@@ -9,7 +9,6 @@ import torch.nn.functional as F
 from collections import defaultdict
 
 from dataset import RadioGalaxyDataset, split_mosaics
-from losses import decode_boxes
 from model import TinyFastRCNN
 from cutouts import DIR_INFER_OUTPUTS
 
@@ -26,8 +25,8 @@ def _iou(a, b):
     return inter / max(aa + ab - inter, 1e-9), aa, ab
 
 
-def predict_best(model, image, proposals, device, use_regression=False):
-    """Returns (best_box, best_score, best_label, best_index).
+def predict_best(model, image, proposals, device):
+    """Returns (best_box, best_score, best_index).
 
     Unlike generic detection we want ONE region per cutout: the highest-scoring
     proposal covering the centre component. No NMS -- proposals are a fixed
@@ -38,32 +37,18 @@ def predict_best(model, image, proposals, device, use_regression=False):
     proposals = proposals.to(device)
 
     with torch.no_grad():
+        # run model on image. Generates raw scores for each proposal
         cls_logits, box_deltas = model(image, [proposals])
         scores = F.softmax(cls_logits, dim=1)
-        num_classes = scores.size(1)
 
         fg_scores, fg_labels = scores[:, 1:].max(dim=1)
-        fg_labels = fg_labels + 1
-
+        
+        # choose the highest score and select the corresponding box
         best_idx = int(torch.argmax(fg_scores))
         box = proposals[best_idx]
 
-        if use_regression:
-            d = box_deltas.view(-1, num_classes, 4)[best_idx, fg_labels[best_idx]]
-            box = decode_boxes(box[None, :], d[None, :])[0]
+    return (box.cpu(), float(fg_scores[best_idx]), best_idx)
 
-    return (box.cpu(), float(fg_scores[best_idx]),
-            int(fg_labels[best_idx]), best_idx)
-
-
-def components_in_box(box, centre_xy, neighbour_xy):
-    """Which component centres fall inside the predicted region."""
-    x1, y1, x2, y2 = [float(v) for v in box]
-    inside = [0]                       # the centre component, always
-    for i, (x, y) in enumerate(neighbour_xy):
-        if x1 <= x <= x2 and y1 <= y <= y2:
-            inside.append(i + 1)
-    return inside
 
 def count_components(box, neighbour_xy):
     """Number of components inside the predicted region (centre always counts)."""
@@ -73,6 +58,7 @@ def count_components(box, neighbour_xy):
     xy = np.asarray(neighbour_xy, dtype=float)
     inside = ((xy[:, 0] >= x1) & (xy[:, 0] <= x2) &
               (xy[:, 1] >= y1) & (xy[:, 1] <= y2))
+    
     return 1 + int(inside.sum())
 
 from scipy.stats import chi2
@@ -107,7 +93,8 @@ def gap_heterogeneity(per):
           f"{'mosaics genuinely differ' if Q > crit else 'consistent with one common gap'}")
     return gap_pooled, se_pooled, Q
 
-def evaluate(model, dataset, device, use_regression=False, verbose_n=10,
+
+def evaluate(model, dataset, device, verbose_n=10,
              iou_correct=0.9):
     """Catalogue accuracy vs the no-association baseline, overall and per mosaic.
  
@@ -119,9 +106,10 @@ def evaluate(model, dataset, device, use_regression=False, verbose_n=10,
                                "cf": [], "bf": []})       # flag lists
 
     correct = baseline = with_gt = too_many = too_few = 0
-    n_multi = multi_correct = multi_base = 0
+    n_multi = multi_correct = 0
  
     for i in range(len(dataset)):
+        # retrieve the image, the proposals and ground truth and insert those into the model to return a chosen box and its score 
         image, proposals, gt_boxes, gt_labels = dataset[i]
         if len(gt_boxes) == 0:
             continue
@@ -129,9 +117,10 @@ def evaluate(model, dataset, device, use_regression=False, verbose_n=10,
         mid = dataset.samples[i]["mosaic_id"]
         per[mid]["n"] += 1
  
-        box, score, label, idx = predict_best(
-            model, image.unsqueeze(0), proposals, device, use_regression)
+        box, score, idx = predict_best(model, image.unsqueeze(0), proposals, device)
  
+ 
+        # CHECK ACCURACY AND RECORD STATS
         gt = [float(v) for v in gt_boxes[0]]
         iou, a_pred, a_gt = _iou([float(v) for v in box], gt)
         b_iou, _, _ = _iou([float(v) for v in proposals[0]], gt)
@@ -167,7 +156,9 @@ def evaluate(model, dataset, device, use_regression=False, verbose_n=10,
     if with_gt == 0:
         print("no samples with ground truth")
         return {}
- 
+    
+    
+    # CALCULATE AND PRINT STATISTICS
     acc, base = correct / with_gt, baseline / with_gt
     print(f"\ncatalogue accuracy : {acc:.1%}  ({correct}/{with_gt})")
     print(f"no-assoc baseline  : {base:.1%}")
@@ -241,7 +232,7 @@ def log_result(path, res, meta, split, extra=None):
     print(f"\nlogged -> {path}")
 
 
-def visualize(image, box, gt_box, score, label, save_path, encoding="radio3", title=None, n_pred=1):
+def visualize(image, box, gt_box, score, save_path, encoding="radio3", title=None, n_pred=1):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -275,7 +266,7 @@ def visualize(image, box, gt_box, score, label, save_path, encoding="radio3", ti
                                        linestyle="--"))
         
     x1, y1, x2, y2 = [float(v) for v in box]
-    color = CLASS_COLORS.get(label, "red")
+    color = "lime"
     ax.add_patch(patches.Rectangle((x1, y1), x2 - x1, y2 - y1, lw=1.5,
                                    edgecolor=color, facecolor="none"))
     ax.text(x1, y1 - 2, f"{n_pred} comp  {score:.2f}",
@@ -300,8 +291,6 @@ def main():
     ap.add_argument("--num-figures", type=int, default=12)
     ap.add_argument("--seed", type=int, default=42,
                     help="must match the seed used in train.py")
-    ap.add_argument("--use-regression", action="store_true",
-                    help="apply box deltas; off by default (Mostert disables it)")
     ap.add_argument("--output-dir", default=DIR_INFER_OUTPUTS)
     a = ap.parse_args()
     
@@ -329,23 +318,31 @@ def main():
               f"falling back to --size {size} --max-neighbours {max_nb}. "
               f"These MUST match what training used.")
 
+    # DETERMINISTICALLY SPLIT IDS
     train_ids, val_ids, test_ids = split_mosaics(a.data_root, seed=a.seed)
+    
     ids = {"train": train_ids, "val": val_ids, "test": test_ids}[a.split]
     if not ids:
         raise SystemExit(f"'{a.split}' split is empty: {train_ids} {val_ids} {test_ids}")
     print(f"{a.split} mosaics: {ids}")
 
+
+    # LOAD DATASET AND MODEL
     ds = RadioGalaxyDataset(a.data_root, ids, size=size, max_neighbours=max_nb,
                             encoding=encoding)
 
     model = TinyFastRCNN(num_classes=num_classes, in_channels=in_channels).to(device)
     model.load_state_dict(state_dict)
 
-    res = evaluate(model, ds, device, use_regression=a.use_regression)
+    
+    # RUN THE MODEL ON LOADED DATASET AND LOG RESULTS
+    res = evaluate(model, ds, device)
     log_result(os.path.join(here, "results.csv"), res, ckpt, a.split)
     
     os.makedirs(output_dir, exist_ok=True)
     
+    
+    # VISUALISE SELECTION OF OUTPUTS
     # pick interesting samples rather than the first N
     order = sorted(range(len(ds)),
                    key=lambda i: (len(ds.samples[i]["gt_label"]) == 0,
@@ -353,15 +350,15 @@ def main():
                                   if len(ds.samples[i]["gt_label"]) else True))
     
     for n, i in enumerate(order[:a.num_figures]):
+        # retrieve the image, the proposals and ground truth and insert those into the model to return a chosen box and its score 
         image, proposals, gt_boxes, gt_labels = ds[i]
-        box, score, label, _ = predict_best(
-            model, image.unsqueeze(0), proposals, device, a.use_regression)
+        box, score, _ = predict_best(model, image.unsqueeze(0), proposals, device)
 
         nb_xy = ds.samples[i].get("neighbour_xy")
         n_pred = count_components(box, nb_xy)
         n_true = count_components(gt_boxes[0], nb_xy) if len(gt_boxes) else 0
 
-        visualize(image, box, gt_boxes, score, label,
+        visualize(image, box, gt_boxes, score,
                   os.path.join(output_dir, f"sample_{n:04d}.png"),
                   encoding,
                   title=f"{ds.samples[i]['source_name']}\n"

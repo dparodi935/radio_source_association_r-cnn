@@ -21,11 +21,8 @@ from astropy.wcs import WCS
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # add the folder 'test_cnn' to  the sys path
 
-from cutouts import discover_mosaics, DIR_MOSAIC, DIR_RAW, DIR_LARGE, DIR_COMP
+from cutouts import discover_mosaics, DIR_MOSAIC, DIR_RAW, DIR_LARGE, DIR_COMP, FLUX_MIN_MJY, MAJ_MIN_ARCSEC, CUTOUT_PX
 
-MAJ_MIN_ARCSEC = 15.0        # cutout-centre selection (Mostert et al. 2022)
-FLUX_MIN_MJY = 10.0
-CUTOUT_PX = 200              # must match training --size
 MARGIN_PX = CUTOUT_PX / 2    # so a full cutout fits inside the image
 
 
@@ -98,9 +95,9 @@ def assign(data_root, raw_path, comp_path, margin_px=MARGIN_PX):
         sub = raw[owner == j]
         sub.write(os.path.join(data_root, DIR_RAW, f"{mid}.fits"), overwrite=True)
 
-        big = ((np.asarray(sub["Maj"], float) > MAJ_MIN_ARCSEC) &
+        filter = ((np.asarray(sub["Maj"], float) > MAJ_MIN_ARCSEC) &
                (np.asarray(sub["Total_flux"], float) > FLUX_MIN_MJY))
-        sub[big].write(os.path.join(data_root, DIR_LARGE, f"{mid}.fits"),
+        sub[filter].write(os.path.join(data_root, DIR_LARGE, f"{mid}.fits"),
                        overwrite=True)
 
         # component rows for this mosaic's components AND their siblings, so

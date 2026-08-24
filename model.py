@@ -15,7 +15,7 @@ class TinyFastRCNN(nn.Module):
         super(TinyFastRCNN, self).__init__()
         
         # 1. THE BACKBONE (Feature Extractor) - Creates the feature map
-        # Downsamples the image spatial dimensions by a factor of 8 (2^3)
+        # Downsamples the image spatial dimensions by a factor of 4 (2^2)
         self.backbone = nn.Sequential(
             # Block 1: 128x126 -> 64x64 - THESE NUMBERS AREN'T ACCURATE SINCE I'VE MODIFIED CUTOUT SIZE
             nn.Conv2d(in_channels, 16, kernel_size=3, padding=1), #output_channels=16 ie. 16 filters, 16 feature maps
@@ -40,7 +40,7 @@ class TinyFastRCNN(nn.Module):
         # 2. THE ROI ALIGN LAYER
         # Maps arbitrary bounding boxes onto the 32x32 feature map and 
         # pools them into fixed 7x7 spatial tensors.
-        # spatial_scale = 1.0 / 8.0 (because our backbone reduced dimensions by 8x)
+        # spatial_scale = 2.0 / 8.0 (because our backbone reduced dimensions by 4x)
         self.roi_align = ops.RoIAlign(
             output_size=(7, 7), 
             spatial_scale=0.25, 
@@ -79,18 +79,18 @@ class TinyFastRCNN(nn.Module):
             cls_logits: Shape (Total_Boxes_In_Batch, num_classes)
             box_deltas: Shape (Total_Boxes_In_Batch, num_classes * 4)
         """
-        # Step 1: Extract full-image feature maps in a single forward pass
+        # Extract full-image feature maps in a single forward pass
         feature_maps = self.backbone(images)
         
-        # Step 2: Pool variable-sized boxes into uniform 7x7x64 feature cubes
+        # Pool variable-sized boxes into uniform 7x7x64 feature cubes
         # RoIAlign automatically handles formatting the box list for the batch
         pooled_rois = self.roi_align(feature_maps, boxes)
         
-        # Step 3: Flatten spatial dimensions (Total_Boxes, 64*7*7) and run dense network
+        # Flatten spatial dimensions (Total_Boxes, 64*7*7) and run dense network
         flattened_rois = pooled_rois.view(pooled_rois.size(0), -1)
         shared_features = self.fc_shared(flattened_rois)
         
-        # Step 4: Branch into simultaneous classification and regression
+        # Branch into simultaneous classification and regression
         cls_logits = self.cls_head(shared_features)
         box_deltas = self.reg_head(shared_features)
         

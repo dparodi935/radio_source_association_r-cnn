@@ -22,7 +22,7 @@ class RadioGalaxyDataset(Dataset):
             pre = SamplesPreprocessor(mid, data_root, size=size,
                                       max_neighbours=max_neighbours,
                                       rotations=rotations, encoding=encoding)
-            self.samples.extend(pre.generate_samples_list(verbose=verbose))
+            self.samples.extend(pre.generate_samples_list(verbose=verbose)) # extend appends the items of the samples list individually
 
         if verbose:
             n_gt = sum(1 for s in self.samples if len(s["gt_box"]) > 0)
@@ -54,11 +54,13 @@ class RadioGalaxyDataset(Dataset):
 
 def split_mosaics(data_root, fracs=(0.7, 0.15, 0.15), seed=42,
                   max_train=None, max_val=None, max_test=None):
-    """Partition mosaic ids by whole mosaic, so no cutout leaks across splits."""
+    """Partition mosaic ids by whole mosaic, so no cutout leaks across splits. Returns list of ids for each function
+    """
     ids = discover_mosaics(data_root)
     if not ids:
         raise RuntimeError(f"no mosaics found under {data_root}")
-    random.Random(seed).shuffle(ids)
+    
+    random.Random(seed).shuffle(ids) # deterministically shuffles ids
 
     n = len(ids)
     n_tr = max(1, int(round(fracs[0] * n)))
@@ -78,16 +80,4 @@ def collate_fn(batch):
     images, proposals, gt_boxes, gt_labels = zip(*batch)
     return (torch.stack(images, 0), list(proposals),
             list(gt_boxes), list(gt_labels))
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
- ###################################    ################################### ################################### ###################################
     

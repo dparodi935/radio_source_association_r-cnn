@@ -15,8 +15,6 @@ import torchvision.transforms.functional as TF
 from optical import OpticalTiles, encode_optical
  
 
-
-
 # --- folder names, one per catalogue type. Edit to match your disk layout. ---
 DIR_MOSAIC = "mosaics"
 DIR_RAW = "pybdsf_raw"        # proposals come from here (all components)
@@ -45,6 +43,10 @@ ENCODINGS = {
 #   w1masked  as w1, but zeroed where radio < 3 sigma (Wu et al. 2019a)
 
 ENCODING_VERSION = "sigma3_rot"      # bump: cache now holds rotated cutouts
+
+FLUX_MIN_MJY = 10.0
+MAJ_MIN_ARCSEC = 15.0        # cutout-centre selection (Mostert et al. 2022)
+CUTOUT_PX = 200              # must match training --size
 
 
 def encoding_needs_optical(encoding):
@@ -97,11 +99,11 @@ class SamplesPreprocessor:
         self.reuse_cutouts = reuse_cutouts
         self.rotations = tuple(rotations)      # (0,) for val/test
 
-        self.create_file_paths()
+        self.create_file_paths() # defines filepaths and makes sure they all exist
         self.extract_data()
-        self.open_catalogues()
+        self.open_catalogues() # filters catalogues, creates useful lists and variables, including dictionary of sources and their components
         
-        # optical tiles are shared across mosaics -> load lazily, once
+        # load optical tiles - optical tiles are shared across mosaics -> load lazily, once
         self.optical = None
         if encoding_needs_optical(encoding):
             self.optical = _get_optical_tiles(os.path.join(data_root, DIR_OPTICAL))
@@ -129,7 +131,7 @@ class SamplesPreprocessor:
     
     def extract_data(self):
         with fits.open(self.fits_filepath) as f:
-            self.data = np.squeeze(f[0].data)
+            self.data = np.squeeze(f[0].data) # np.squeeze removes dimensions of size 1 (e.g. (1,200,200) -> (200,200))
             if self.data.ndim != 2:
                 raise ValueError(f"expected 2D image, got {self.data.shape}")
             self.coord_system = WCS(f[0].header).celestial
@@ -139,13 +141,12 @@ class SamplesPreprocessor:
         self.pixel_arcsec = self.coord_scale * 3600.0
 
         # DR2 rms map: per-pixel noise, same grid, same units as the image.
-        # Using this rather than the DR1 catalogue's Isl_rms, because the
-        # catalogue noise was measured on DR1 pixels and we image in DR2.
         with fits.open(self.rms_filepath) as f:
             self.rms_data = np.squeeze(f[0].data)
             self.rms_wcs = WCS(f[0].header).celestial
-            rms_bunit = str(f[0].header.get("BUNIT", "")).strip().upper()
+            rms_bunit = str(f[0].header.get("BUNIT", "")).strip().upper() # gets unit to check against image data
 
+        # rms map error checking
         if self.rms_data.shape != self.data.shape:
             raise ValueError(
                 f"[{self.mosaic_id}] rms grid {self.rms_data.shape} != "
@@ -158,8 +159,7 @@ class SamplesPreprocessor:
         print(f"[{self.mosaic_id}] rms map: median "
               f"{np.median(finite) * 1e6:.0f} uJy/beam, "
               f"{100 * (1 - finite.size / self.rms_data.size):.1f}% blank")
-        
-        
+                
         
     def _shape_scale(self, table):
         """Pixels per catalogue shape unit. LoTSS catalogues use arcsec; PyBDSF's
@@ -171,18 +171,19 @@ class SamplesPreprocessor:
                 return 1.0 / self.coord_scale
             if u.startswith("arcsec") or u == "s":
                 return 1.0 / self.pixel_arcsec
+            
+        # if units are not specified in the table (in practice they are), then we figure out the unit by looking the order of magnitude
         med = float(np.nanmedian(np.asarray(table["Maj"], float)))
         # a source is never 0.1 deg across, and never 1e-4 arcsec
         return 1.0 / self.coord_scale if med < 0.1 else 1.0 / self.pixel_arcsec    
         
+        
     def open_catalogues(self):
+        """Filters catalogues, creates a catalogue of sources and their components, and more
+        """
         self.raw_catalogue = Table.read(self.raw_cat_path, format="fits")
         self.centre_catalogue = Table.read(self.large_cat_path, format="fits")
         
-        #brightness cut
-        sel = (np.asarray(self.centre_catalogue["Total_flux"], float) > 10.0)
-        self.centre_catalogue = self.centre_catalogue[sel]
-
         comp = Table.read(self.comp_cat_path, format="fits")
  
         # NOTE the inversion: in the component catalogue,
@@ -191,12 +192,12 @@ class SamplesPreprocessor:
         comp_names = np.asarray(comp["Component_Name"]).astype(str)
         va_names = np.asarray(comp["Source_Name"]).astype(str)
 
-
         # exclude bright-galaxy associations (nearby galaxies grouped by 2MASX
         # ellipse: many arcmin across, can never fit a 300" cutout) and
         # deblended entries (one component split into several sources).
         keep = np.ones(len(comp), bool)
 
+        # creates mask to filter out select sources
         if "ID_flag" in comp.colnames:
             flag = np.asarray(comp["ID_flag"], int)
             bright_gal = np.isin(flag, [2, 22])
@@ -205,25 +206,31 @@ class SamplesPreprocessor:
         else:
             self.n_bright_gal = 0
 
+        # creates mask to filter out deblended sources
         if "Deblended_from" in comp.colnames:
             deb = np.asarray(comp["Deblended_from"]).astype(str)
-            deblended = ~((deb == "") | (deb == "--") | (deb == "nan"))
+            deblended = ~((deb == "") | (deb == "--") | (deb == "nan")) # ~ is not, so this mask captures sources that have been deblended
             self.n_deblended = int(deblended.sum())
             keep &= ~deblended
         else:
             self.n_deblended = 0
 
+        # applies mask
         comp_names, va_names = comp_names[keep], va_names[keep]
- 
+
+        # creates list of names, zip() then turns it into a list of pairs, then dict() turns this into a dictionary
+        # this dict maps components to the sources they are part of 
         self.source_of = dict(zip(comp_names.tolist(), va_names.tolist()))
  
         self.members_of = {}
         for cn, va in zip(comp_names.tolist(), va_names.tolist()):
             self.members_of.setdefault(va, []).append(cn)
+            # want a dictionary with "Source Name": ("component 1", "component 2", etc...)
+            # setdefault(va, []) creates an empty lsit for a source name if it's not already in the dictionary, so the components can be appended to it
  
         # row lookup into the raw catalogue, keyed by its Source_Name
         raw_names = np.asarray(self.raw_catalogue["Source_Name"]).astype(str)
-        self.row_of_key = {n: i for i, n in enumerate(raw_names)}
+        self.row_of_key = {n: i for i, n in enumerate(raw_names)}  # i is the row number
  
         self.n_unjoined = sum(1 for n in comp_names if n not in self.row_of_key)
 
@@ -235,9 +242,10 @@ class SamplesPreprocessor:
                 tbl["Xposn"] = x
                 tbl["Yposn"] = y
                 
-        # shape-column units -> pixels ---
-        self.shape_scale = self._shape_scale(self.raw_catalogue)
+        # shape-column units -> pixels ---   (in our case pixels/arcsec)
+        self.shape_scale = self._shape_scale(self.raw_catalogue) 
 
+        # check if the median major axis fits within the cutout
         med_px = float(np.nanmedian(np.asarray(self.raw_catalogue["Maj"], float))) * self.shape_scale
         print(f"[{self.mosaic_id}] pixel={self.pixel_arcsec:.2f}\"  median Maj={med_px:.1f} px "
               f"(cutout {self.size} px = {self.size * self.pixel_arcsec:.0f}\")")
@@ -278,7 +286,9 @@ class SamplesPreprocessor:
         cutout_xy : (n,2) their positions in UNROTATED cutout coords
         """
         xs, ys = [], []
-        rx, ry = self._rotate_point(cutout_xy[:, 0], cutout_xy[:, 1], angle_deg)
+        rx, ry = self._rotate_point(cutout_xy[:, 0], cutout_xy[:, 1], angle_deg) # rotate coords to match angle
+        
+        # calculates the extent of the ellipses in the x and y direction of every component, and makes a list of them
         for row, x, y in zip(rows, np.atleast_1d(rx), np.atleast_1d(ry)):
             # the ellipse rotates with the image: add angle to its PA
             theta = np.radians(90.0 - (row["PA"] + angle_deg))
@@ -289,6 +299,8 @@ class SamplesPreprocessor:
             xs += [x - dx, x + dx]
             ys += [y - dy, y + dy]
         xs, ys = np.array(xs), np.array(ys)
+        
+        #selects the most extreme extents to create a tight box around all components
         return [float(max(xs.min(), 0.0)), float(max(ys.min(), 0.0)),
                 float(min(xs.max(), self.size)), float(min(ys.max(), self.size))]
                         
@@ -312,22 +324,11 @@ class SamplesPreprocessor:
         x, y = pixel_pos
         return (x - half >= 0) and (x + half <= nx) and (y - half >= 0) and (y + half <= ny)
 
-    def _write_cutout(self, cutout, filepath, rms_jy):
-        if self.reuse_cutouts and os.path.exists(filepath):
-            return True
-        d = np.nan_to_num(cutout.data, nan=0.0, posinf=0.0, neginf=0.0)
-        if not np.isfinite(d).any() or rms_jy <= 0:
-            return False
-        s = d / rms_jy                                   # image in sigma units
-        ch0 = np.sqrt(np.clip((s - 1.0) / 29.0, 0.0, 1.0))   # 1-30 sigma
-        ch1 = (s > 3.0).astype(np.float32)
-        ch2 = (s > 5.0).astype(np.float32)
-        np.save(filepath, np.stack([ch0, ch1, ch2]).astype(np.float32))
-        return True
-    
     
     def _filter_unresolved(self, table):
-        """Drop compact, likely-unrelated neighbours (Mostert's GBC proxy)."""
+        """Drop compact, likely-unrelated neighbours (Mostert's GBC proxy)
+           Keeps sources with a major axis > 1.5* the beam width OR a ratio of major to minor axis > 1.5
+        """
         if len(table) == 0:
             return table
         maj = np.asarray(table["Maj"], float)              # arcsec
@@ -337,21 +338,25 @@ class SamplesPreprocessor:
 
 
     def _gt_member_indices(self, centre_gauss, nb, all_in_window):
-        """(indices into [centre]+nb, number of true members in the catalogue)."""
+        """(indices of gt source components into [centre]+nb, number of true members in the catalogue)."""
         key = str(centre_gauss["Source_Name"])
-        va_name = self.source_of.get(key)
-        if va_name is None:
+        va_name = self.source_of.get(key) # finds the source corresponding to the centre component 
+        if va_name is None: # can't find source
             return [], 0
+        
+        # use the source name to get a list of components from the dictionary compiled in open_catalogues()
         member_keys = set(self.members_of.get(va_name, []))
         if not member_keys:
             return [], 0
+        
+        # create list of positions of the neighbours that are part of the same source
         idx = [0]
         for i, r in enumerate(nb):
             if str(r["Source_Name"]) in member_keys:
                 idx.append(i + 1)
         
+        # stats
         n_true = len(member_keys)
-        
         found = {str(r["Source_Name"]) for r in nb}
         in_window = {str(r["Source_Name"]) for r in all_in_window}
         missing = member_keys - found - {key}
@@ -423,66 +428,79 @@ class SamplesPreprocessor:
         half = self.size / 2.0
 
         for idx, centre_gauss in enumerate(self.centre_catalogue):
+            #gets the position of the source in the *mosaic* in terms of pixels
             pixel_pos = (float(centre_gauss["Xposn"]), float(centre_gauss["Yposn"]))
+            
+            # check that a cutout centred on the source would fit entirely within the image 
             if not self._in_image_bounds(pixel_pos):
                 n_skipped += 1
                 continue
  
             key = str(centre_gauss["Source_Name"])
  
+            # create the cutouts of the image and noise map
             cutout = Cutout2D(self.data, pixel_pos, self.size,
                               wcs=self.coord_system)
             rms_cutout = Cutout2D(self.rms_data, pixel_pos, self.size,
                                   wcs=self.rms_wcs)
 
+            # returns (C,H,W) depending on the encoding chosen
             base_img = self._make_cutout_array(cutout, rms_cutout)
             if base_img is None:
                 n_skipped += 1
                 continue
-             
+            
+            # the (x, y) index of the origin pixel of the cutout wrt the original array.
             origin = (cutout.origin_original[0], cutout.origin_original[1])
-            source_centre = (pixel_pos[0] - origin[0], pixel_pos[1] - origin[1])
  
-            # neighbours, sorted + filtered exactly as generate_proposals does
+            # neighbours, sorted + filtered
+            # in_bounds is a mask that selects all sources in the raw catalogue that are within the cutout (aside from the centre source)
             in_bounds = ((np.abs(raw_x - pixel_pos[0]) < half) &
                          (np.abs(raw_y - pixel_pos[1]) < half) &
                          (raw_key != key))
-            neighbours = self._filter_unresolved(raw[in_bounds])
+            neighbours = self._filter_unresolved(raw[in_bounds]) # drop sources believed to be unresolved
             nb = self.sort_by_proximity(centre_gauss, neighbours)[:self.max_neighbours]
-            n_dropped = max(0, len(neighbours) - self.max_neighbours)
+            n_dropped = max(0, len(neighbours) - self.max_neighbours) # counts how many neighbours are dropped by the neighbour cap
 
-            # component list: index 0 = centre, then neighbours
-            members = [centre_gauss] + [r for r in nb]
+            # component list: index 0 = centre, then neighbours sorted by proximity
+            members = [centre_gauss] + [r for r in nb] 
+            # list of (x,y) pixel position of every component in terms of the cutout
             mem_xy = np.array(
                 [[pixel_pos[0] - origin[0], pixel_pos[1] - origin[1]]] +
-                [[float(r["Xposn"]) - origin[0], float(r["Yposn"]) - origin[1]]
-                 for r in nb], dtype=float)
+                [[float(r["Xposn"]) - origin[0], float(r["Yposn"]) - origin[1]] for r in nb],
+                dtype=float)
             
-            # true association, as indices into `members`
+            # gt_idx is the list of indices of members that are part of the same source as the centre one
             gt_idx, n_true = self._gt_member_indices(centre_gauss, nb, raw[in_bounds])
+            
+            # stats, measuring number of multi-component sources and how many are fully captured
             if n_true > 1:
                 self.n_multi_truth += 1  # real number of multi-component sources
                 if len(gt_idx) < n_true:
                     self.n_truth_lost += 1   # number of sources where we don't capture all the components
 
+
             for angle in self.rotations:
                 img = self._rotate_image(base_img, angle)
+                
+                # saves rotated images if not already done
                 fp = os.path.join(self.cutout_dir, f"{_safe(key)}_r{angle}.npy")
                 if not (self.reuse_cutouts and os.path.exists(fp)):
                     np.save(fp, img)
 
+                # creates list of proposals from every unique combination of components
                 proposals = []
+                # varies number of neighbouring components (k) included from 0 to all
                 for k in range(len(nb) + 1):
+                    # combinations creates list of k-length combinations of neighbouring components
                     for combo in combinations(range(1, len(nb) + 1), k):
-                        sel = (0,) + combo
-                        proposals.append(self._box_from_members(
-                            [members[j] for j in sel], mem_xy[list(sel)], angle))
+                        sel = (0,) + combo 
+                        proposals.append( self._box_from_members([members[j] for j in sel], mem_xy[list(sel)], angle) )
                 proposals = np.asarray(proposals, dtype=np.float32)
 
+                # creates ground truth box and label
                 if gt_idx:
-                    gt_box = np.array([self._box_from_members(
-                        [members[j] for j in gt_idx],
-                        mem_xy[list(gt_idx)], angle)], dtype=np.float32)
+                    gt_box = np.array([self._box_from_members([members[j] for j in gt_idx], mem_xy[list(gt_idx)], angle)], dtype=np.float32)
                     gt_label = np.array([2 if len(gt_idx) > 1 else 1], np.int64)
                 else:
                     gt_box = np.empty((0, 4), np.float32)
@@ -490,8 +508,10 @@ class SamplesPreprocessor:
                     if angle == self.rotations[0]:
                         n_nogt += 1
 
-                nb_xy_rot = np.stack(self._rotate_point(
-                    mem_xy[1:, 0], mem_xy[1:, 1], angle), axis=1) \
+                # rotated neighbour coordinates
+                nb_xy_rot = np.stack(
+                    self._rotate_point(mem_xy[1:, 0], mem_xy[1:, 1], angle), 
+                    axis=1) \
                     if len(nb) else np.empty((0, 2))
 
                 samples.append({
