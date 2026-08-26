@@ -4,13 +4,13 @@ import torch.nn.functional as F
 import torchvision.ops as ops
 
 class TinyFastRCNN(nn.Module):
-    def __init__(self, num_classes=3, in_channels=1):
+    def __init__(self, num_classes=2, in_channels=1):
         """
         An educational Fast R-CNN model for astronomical FITS images.
         
         Args:
-            num_classes: Number of target classes (e.g., 0=Background, 1=FRI, 2=FRII).
-            in_channels: 1 for standard FITS continuum maps, 3 if stacking radio+IR.
+            num_classes: Number of target classes (in this case 0=Background, 1=Radio source).
+            in_channels: Number of input channels
         """
         super(TinyFastRCNN, self).__init__()
         
@@ -65,7 +65,7 @@ class TinyFastRCNN(nn.Module):
         
         # Head B: Bounding Box Regression (predicts 4 adjustment deltas per class: dx, dy, dw, dh)
         # We output 4 * num_classes so each class gets its own customized box tweaks
-        #BELIEVE THIS IS UNUSED BY MOSTERT ET AL. 2022
+        # UNUSED
         self.reg_head = nn.Linear(128, num_classes * 4)
 
     def forward(self, images, boxes):
