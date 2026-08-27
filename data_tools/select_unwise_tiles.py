@@ -54,17 +54,35 @@ def select(data_root, tiles_path="tiles.fits"):
         print(f"->IDS = {ids}")
         wanted |= ids
 
-    print(f"\n{len(wanted)} unique tiles")
+    total_tiles = len(wanted)
+    print(f"\n{total_tiles} unique tiles")
+    
+    # Determine the output directory and ensure path uses forward slashes for bash compatibility
+    out_dir = os.path.join(data_root, "optical_tiles").replace('\\', '/')
     
     # Creates a bash file and writes a line to download each tile
     with open("download_unwise.sh", "w", newline='\n') as fh:
-        for t in sorted(wanted):
-            fh.write("wget -r -nH --cut-dirs=1 -c "
-                     f"https://unwise.me/data/neo11/unwise-coadds/fulldepth/"
-                     f"{t[:3]}/{t}/unwise-{t}-w1-img-m.fits\n")
+        fh.write(f'echo "Starting download of {total_tiles} unWISE tiles..."\n')
+        fh.write('echo "--------------------------------------------------"\n')
+        
+        for i, t in enumerate(sorted(wanted), start=1):
+            filename = f"unwise-{t}-w1-img-m.fits"
+            url = f"https://unwise.me/data/neo11/unwise-coadds/fulldepth/{t[:3]}/{t}/{filename}"
+            
+            # Print the current progress, what is being downloaded, and where it is going
+            fh.write(f'echo "[{i}/{total_tiles}] Downloading tile: {t}"\n')
+            fh.write(f'echo "  -> From: {url}"\n')
+            fh.write(f'echo "  -> To:   {out_dir}/{filename}"\n')
+            
+            # Download quietly but show a clean progress bar, continuing if partial, saving to out_dir
+            fh.write(f'wget -q --show-progress -c -P "{out_dir}" {url}\n')
+            fh.write('echo "--------------------------------------------------"\n')
+            
+        fh.write('echo "All downloads complete!"\n')
+            
     print("wrote download_unwise.sh")
 
 if __name__ == "__main__":
     data_root = r"..\cnn_data"
-    tiles_path = data_root+r"\optical_tiles\tiles.fits"
+    tiles_path = os.path.join(data_root, "optical_tiles", "tiles.fits")
     select(data_root, tiles_path)
