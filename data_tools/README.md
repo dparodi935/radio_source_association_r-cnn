@@ -34,8 +34,9 @@ Note that the DR1 catalogues do not fully cover the DR2 Hetdex regions, but trai
 
 
 ### Optical data
+[unWISE tiles.fit download](https://unwise.me/imgsearch/)
 [unWISE](https://unwise.me/data/allwise/unwise-coadds/fulldepth)
 
-Follow the above link and download `tiles.fits`.
+Follow the first link and click 'FITS table of available tiles' to download `tiles.fits` .
 
-Then open `select_unwise_tiles.py`, specify the right file paths, and run the script, which will select the optical images that entirely cover the area of the LoTSS images, and writes a bash script which when executed will download them all.
+Then with the second link open `select_unwise_tiles.py`, specify the right file paths, and run the script, which will select the optical images that entirely cover the area of the LoTSS images, and writes a bash script which when executed will download them all.
