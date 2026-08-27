@@ -524,9 +524,10 @@ class SamplesPreprocessor:
                     "gt_label": gt_label,
                     "neighbour_xy": nb_xy_rot.astype(np.float32),
                     "n_dropped": n_dropped,
+                    "gt_idx": gt_idx,
                 })
 
-                if idx % 50 == 0:
+                if idx % 1 == 0:
                     self.visualize_cutout(img, proposals, gt_box, f"{key}_r{angle}", gt_label,
                                           channels=self.channels)    
                 
@@ -552,7 +553,7 @@ class SamplesPreprocessor:
 
         return samples
     
-        
+
     def visualize_cutout(self, image_data, proposals, gt_boxes, name, gt_label,
                      channels=None):
         channels = channels or ("sqrt1_30",)
