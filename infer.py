@@ -359,7 +359,6 @@ def main():
         raise SystemExit(f"'{a.split}' split is empty: {train_ids} {val_ids} {test_ids}")
     print(f"{a.split} mosaics: {ids}")
 
-
     # LOAD DATASET AND MODEL
     ds = RadioGalaxyDataset(a.data_root, ids, size=size, max_neighbours=max_nb,
                             encoding=encoding)
@@ -367,43 +366,76 @@ def main():
     model = TinyFastRCNN(num_classes=num_classes, in_channels=in_channels).to(device)
     model.load_state_dict(state_dict)
 
-    
-    # RUN THE MODEL ON LOADED DATASET AND LOG RESULTS
+    # RUN THE MODEL ON LOADED DATASET AND LOG OVERALL RESULTS
     res = evaluate(model, ds, device)
     log_result(os.path.join(here, "results.csv"), res, ckpt, a.split)
     
     os.makedirs(output_dir, exist_ok=True)
+    infer_output_dir = os.path.join(output_dir, encoding)
+    os.makedirs(infer_output_dir, exist_ok=True)
     
-    
-    # VISUALISE SELECTION OF OUTPUTS
+    # VISUALISE & LOG DETAILED PREDICTIONS
     order = sorted(range(len(ds)),
                    key=lambda i: (len(ds.samples[i].get("gt_label", [])) == 0,
                                   ds.samples[i].get("gt_label", [0])[0] != 2
                                   if len(ds.samples[i].get("gt_label", [])) else True))
     
-    for n, i in enumerate(order[:a.num_figures]):
-        image, proposals, gt_boxes, gt_labels = ds[i]
-        box, score, _ = predict_best(model, image.unsqueeze(0), proposals, device)
-
-        nb_xy = ds.samples[i].get("neighbour_xy")
-        
-        # Calculate predicted components spatially, but get true components exactly from ID
-        n_pred = len(get_components_in_box(box, nb_xy))
-        gt_idx_list = ds.samples[i].get("gt_idx", [0])
-        n_true = len(gt_idx_list)
-                
-        infer_output_dir = os.path.join(output_dir,encoding)
-        os.makedirs(infer_output_dir, exist_ok=True)
-
-        
-        visualize(image, box, gt_boxes, score,
-                  os.path.join(infer_output_dir, f"sample_{n:04d}.png"),
-                  encoding,
-                  title=f"{ds.samples[i]['source_name']}\n"
-                        f"pred {n_pred} comp / true {n_true}",
-                  n_pred=n_pred)
-    print(f"figures -> {infer_output_dir}/")
+    predictions_csv_path = os.path.join(output_dir, f"predictions_{a.split}_{encoding}.csv")
+    write_header = not os.path.exists(predictions_csv_path)
     
+    with open(predictions_csv_path, "a", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        if write_header:
+            writer.writerow(["mosaic_id", "source_name", "encoding", "score", "n_pred", "n_true", "status", "pred_components", "true_components"])
+        
+        # Loop through ALL evaluated items to populate the CSV
+        for n, i in enumerate(order):
+            image, proposals, gt_boxes, gt_labels = ds[i]
+            box, score, _ = predict_best(model, image.unsqueeze(0), proposals, device)
+
+            nb_xy = ds.samples[i].get("neighbour_xy")
+            
+            # Determine actual component sets
+            pred_set = get_components_in_box(box, nb_xy)
+            gt_idx_list = ds.samples[i].get("gt_idx", [0])
+            true_set = set(gt_idx_list)
+            
+            n_pred = len(pred_set)
+            n_true = len(true_set)
+            
+            # Categorize the accuracy rigorously using sets
+            if pred_set == true_set:
+                status = "correct"
+                img_suffix = "_rn"
+            elif true_set < pred_set:
+                status = "too_many"
+                img_suffix = "_tm"
+            elif pred_set < true_set:
+                status = "too_few"
+                img_suffix = "_tf"
+            else:
+                status = "mixed"
+                img_suffix = "_ot"
+            
+            key = ds.samples[i].get("source_name", "unknown")
+            mid = ds.samples[i].get("mosaic_id", "unknown")
+            
+            # Write detailed sample information to CSV
+            writer.writerow([mid, key, encoding, round(score, 4), n_pred, n_true, status, str(list(pred_set)), str(list(true_set))])
+            
+            # Generate visualization only for the top N samples
+            if n < a.num_figures:
+                img_name = f"{key}{img_suffix}_{encoding}.png"
+                save_path = os.path.join(infer_output_dir, img_name)
+                
+                visualize(image, box, gt_boxes, score,
+                          save_path,
+                          encoding,
+                          title=f"{key}\npred {n_pred} comp / true {n_true}",
+                          n_pred=n_pred)
+
+    print(f"\nDetailed sample predictions logged to -> {predictions_csv_path}")
+    print(f"Figures saved to -> {infer_output_dir}/")
     
 if __name__ == "__main__":
     main()
