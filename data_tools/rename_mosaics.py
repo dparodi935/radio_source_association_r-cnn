@@ -2,7 +2,7 @@ import os
 from astropy.io import fits
 
 script_dir = os.path.dirname(os.path.realpath(__file__))
-mosaic_folderpath = os.path.join(script_dir,"..","..","cnn_data","rms_mosaics")
+mosaic_folderpath = os.path.join(script_dir,"..","..","cnn_data","mosaics")
 
 mosaic_list = os.listdir(mosaic_folderpath)
 
@@ -19,4 +19,7 @@ for mosaic in mosaic_list:
         trunc_ra, trunc_dec = int(ra), int(dec)
     
     new_filepath = os.path.join(mosaic_folderpath, f"mosaic_{trunc_ra}_{trunc_dec}.fits")
+    
+    print(f"Renamed {mosaic} to mosaic_{trunc_ra}_{trunc_dec}.fits")
+    
     os.rename(fits_filepath, new_filepath)

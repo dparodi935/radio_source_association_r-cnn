@@ -93,10 +93,11 @@ def assign(data_root, raw_path, comp_path, margin_px=MARGIN_PX):
     for j, g in enumerate(geo):
         mid = g["mid"]
         sub = raw[owner == j]
-        sub.write(os.path.join(data_root, DIR_RAW, f"{mid}.fits"), overwrite=True)
+        sub.write(os.path.join(data_root, DIR_RAW, f"{mid}.fits"), overwrite=True)  
 
         filter = ((np.asarray(sub["Maj"], float) > MAJ_MIN_ARCSEC) &
                (np.asarray(sub["Total_flux"], float) > FLUX_MIN_MJY))
+        
         sub[filter].write(os.path.join(data_root, DIR_LARGE, f"{mid}.fits"),
                        overwrite=True)
 
@@ -109,7 +110,7 @@ def assign(data_root, raw_path, comp_path, margin_px=MARGIN_PX):
                          overwrite=True)
 
         total += len(sub)
-        print(f"  {mid}: {len(sub):6d} components, {int(big.sum()):5d} centres, "
+        print(f"  {mid}: {len(sub):6d} components, {int(filter.sum()):5d} centres, "
               f"{int(keep.sum()):6d} comp rows")
 
     print(f"\nassigned {total} (== contained count: {total == int(contained.sum())})")
@@ -123,7 +124,6 @@ if __name__ == "__main__":
     ap.add_argument("--data-root", default=os.path.join("..", "cnn_data"))
     ap.add_argument("--raw", required=True, help="full DR1 PyBDSF catalogue")
     ap.add_argument("--comp", required=True, help="full DR1 component catalogue")
-    ap.add_argument("--margin-px", type=float, default=MARGIN_PX,
-                    help="keep sources this far inside the image edge")
+    ap.add_argument("--margin-px", type=float, default=MARGIN_PX, help="keep sources this far inside the image edge")
     a = ap.parse_args()
     assign(a.data_root, a.raw, a.comp, a.margin_px)

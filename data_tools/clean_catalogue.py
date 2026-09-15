@@ -7,9 +7,10 @@ from astropy.table import Table
 import os
 
 # Load your processed catalog
-data_root = os.path.join("..","..","cnn_data")
+script_dir = os.path.dirname(os.path.abspath(__file__))
+data_root = os.path.join(script_dir,"..","..","cnn_data")
 path = os.path.join(data_root, "raw_dr1_catalogues")
-cat_name = "final_source_cat"
+cat_name = "comp"
 cat = Table.read(os.path.join(path, f"{cat_name}.fits"), format='fits')
   
 # Create a boolean mask for rows with valid numeric values
@@ -24,5 +25,5 @@ valid_mask = (
 clean_cat = cat[valid_mask]
 
 # 3. Save as a clean FITS file
-clean_cat.write(os.path.join(path, f"{cat_name}_ds9.fits"), format='fits', overwrite=True)
+clean_cat.write(os.path.join(path, f"{cat_name}.fits"), format='fits', overwrite=True)
 
