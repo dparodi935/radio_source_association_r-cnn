@@ -7,3 +7,4 @@ runs/
 test_results/
 *.pt
 results.csv
+results.json
